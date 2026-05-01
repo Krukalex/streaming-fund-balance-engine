@@ -34,6 +34,33 @@ The system is built around four core components:
    - Processes events to update a canonical fund balance table
    - Maintains state and supports incremental reconciliation
 
+## Project Structure
+
+```
+streaming-fund-balance-engine/
+├── emitter/
+│   └── emitter.py              # Event producer for transaction events
+├── spark/
+│   └── job.py                  # Spark batch processing job for balance computation
+├── airflow/
+│   └── dags/
+│       └── pipeline_dag.py     # Airflow DAG for orchestrating batch jobs
+├── docker/
+│   └── docker-compose.yml      # Docker Compose configuration for services
+├── db/
+│   └── init.sql                # Database initialization script
+├── README.md                   # This file
+└── .gitignore                  # Git ignore file
+```
+
+### Component Details
+
+- **emitter/** - Contains the event emitter application that generates transaction events for multiple funds and publishes them to Kafka
+- **spark/** - Contains the Spark job that processes batches of events from Kafka and updates the canonical balance table
+- **airflow/** - Contains the Airflow DAG definitions for orchestrating the Spark jobs on a schedule
+- **docker/** - Contains Docker Compose configuration to spin up all required services (Kafka, Airflow, Spark, database)
+- **db/** - Contains database schema and initialization scripts for the canonical balance table
+
 ## What This Project Demonstrates
 
 - design of a scalable, loosely coupled pipeline for financial events
