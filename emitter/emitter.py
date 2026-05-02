@@ -1,73 +1,14 @@
-from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-from typing import Optional
-from decimal import Decimal
 import uuid
 import random
+import time
+from kafka import KafkaProducer
+import json
 
-
-class TransactionType(Enum):
-    """Enum for transaction types."""
-    DEBIT = "DEBIT"
-    CREDIT = "CREDIT"
-    REVERSAL = "REVERSAL"
-
-
-class TransactionStatus(Enum):
-    """Enum for transaction status."""
-    PENDING = "PENDING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-
-
-@dataclass
-class Transaction:
-    """
-    Represents a financial transaction event.
-
-    Attributes:
-        transaction_id: Unique identifier for the transaction (UUID)
-        fund_id: Identifier for the fund
-        fund_name: Name of the fund
-        deal_id: Identifier for the deal
-        deal_name: Name of the deal
-        transaction_amount: Amount of the transaction (as Decimal for precision)
-        transaction_type: Type of transaction (DEBIT, CREDIT, REVERSAL)
-        transaction_timestamp: When the transaction occurred (ISO 8601)
-        currency: Currency code (ISO 4217, e.g., USD, EUR)
-        status: Status of the transaction (PENDING, COMPLETED, FAILED)
-        created_at: When the event was created in the system
-    """
-    transaction_id: str
-    fund: dict
-    deal: dict
-    transaction_amount: Decimal
-    transaction_type: TransactionType
-    transaction_timestamp: datetime
-    currency: str = "USD"
-    status: TransactionStatus = TransactionStatus.COMPLETED
-    created_at: Optional[datetime] = None
-
-    def __post_init__(self):
-        """Validate and set defaults."""
-        if self.created_at is None:
-            self.created_at = datetime.utcnow()
-
-    def to_dict(self):
-        """Convert transaction to dictionary for JSON serialization."""
-        return {
-            "transaction_id": self.transaction_id,
-            "fund": self.fund,
-            "deal": self.deal,
-            # Decimal as string
-            "transaction_amount": str(self.transaction_amount),
-            "transaction_type": self.transaction_type.value,
-            "transaction_timestamp": self.transaction_timestamp.isoformat(),
-            "currency": self.currency,
-            "status": self.status.value,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
+producer = KafkaProducer(
+    bootstrap_servers=["localhost:9092"],
+    value_serializer=lambda v: json.dumps(v).encode("utf-8")
+)
 
 
 funds = [
@@ -81,13 +22,47 @@ funds = [
         {"deal_id": 5, "deal_name": "Deal E"}, {"deal_id": 6, "deal_name": "Deal F"}]},
 ]
 
+transaction_types = ['DEBIT', 'CREDIT']
+statuses = ['PENDING', 'COMPLETED', 'FAILED']
 
-fund = random.choice(funds)
-deal = random.choice(fund['deals'])
 
-print(fund)
-print(deal)
+def generate_transaction() -> dict:
+    """
+    Generate a random transaction for some fund deal combination
+    """
 
+    fund = random.choice(funds)
+    deal = random.choice(fund["deals"])
+
+    transaction = {
+        "transaction_id": str(uuid.uuid4()),
+        "transaction_timestamp": datetime.utcnow().isoformat(),
+        "transaction_amount": round(random.uniform(0, 1000000), 2),
+        "currency": "USD",
+        "transaction_type": random.choice(transaction_types),
+        "status": random.choice(statuses),
+        "fund": {
+            "fund_id": fund["fund_id"],
+            "fund_name": fund["fund_name"]
+        },
+        "deal": {
+            "deal_id": deal["deal_id"],
+            "deal_name": deal["deal_name"]
+        },
+        "metadata": {
+            "source": "simulator",
+            "strategy": "growth",
+        }
+    }
+
+    return transaction
+
+
+while True:
+    transaction = generate_transaction()
+    producer.send("transactions", transaction)
+    print(f"Produced: {transaction}")
+    time.sleep(10)
 
 # # Example usage
 # if __name__ == "__main__":
