@@ -1,0 +1,3 @@
+run spark job in docker:
+
+docker exec -it spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 --jars /opt/spark/jars-extra/* /opt/spark-apps/job.py

@@ -5,3 +5,5 @@ venv/
 .venv/
 *.log/
 .ipynb_checkpoints/
+local_notes
+jars/
