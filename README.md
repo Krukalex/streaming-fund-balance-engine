@@ -1,17 +1,19 @@
 # Streaming Fund Balance Engine
 
-## Project Overview
+## Introduction
 
 The Streaming Fund Balance Engine is an event-driven finance pipeline designed to showcase modern data engineering capabilities using Kafka, Airflow, and Apache Spark. It simulates transaction event flow across funds, maintains an append-only event log, and ultimately computes canonical fund balances through batch processing.
 
-This project is ideal for demonstrating:
+This project demonstrates end-to-end data engineering skills, from event generation to stateful processing, and is built to impress in senior-level interviews and portfolio reviews.
 
-- event-driven architecture for transaction processing
-- stream ingestion and event logging with Kafka
-- workflow orchestration with Apache Airflow
-- batch data processing with Apache Spark
-- state management via a canonical balance table
-- end-to-end data engineering design and implementation
+## Technologies Used
+
+- **Apache Kafka**: Event streaming and durable messaging backbone
+- **Apache Spark**: Batch processing and stateful aggregation
+- **Apache Airflow**: Workflow orchestration and scheduling
+- **Python**: Emitter and consumer applications
+- **Docker**: Containerized services for local development
+- **PostgreSQL**: Canonical balance table storage (optional)
 
 ## Architecture
 
@@ -33,6 +35,80 @@ The system is built around four core components:
    - Consumes transaction event batches
    - Processes events to update a canonical fund balance table
    - Maintains state and supports incremental reconciliation
+
+## Key Features
+
+- Multi-fund transaction simulation with realistic fund-deal relationships
+- Append-only event stream storage with guaranteed ordering
+- Batch orchestration with Airflow DAGs and task dependencies
+- Spark-based balance computation with idempotency and reconciliation
+- Canonical state management for fund balances
+- Modular design for easy extension and testing
+
+## Event Schema
+
+The event schema represents a financial transaction event in an investment fund context. Each event captures a cash flow between investors and the fund, where the fund holds investments in specific deals.
+
+### Design Principles
+
+- **Fund-Deal Relationship**: Transactions are tied to a specific fund and one of its associated deals, reflecting real-world investment structures.
+- **Cash Flow Direction**:
+  - `CREDIT`: Capital calls (money flowing into the fund from investors)
+  - `DEBIT`: Distributions (money flowing out to investors)
+  - `REVERSAL`: Corrections or reversals of previous transactions
+- **Status Lifecycle**: Indicates processing state:
+  - `PENDING`: Transaction initiated but not yet posted
+  - `COMPLETED`: Successfully posted
+  - `FAILED`: Processing failed
+- **Ordering**: Events are ordered by `transaction_timestamp` (ISO 8601 format) to maintain chronological sequence in the event log.
+- **Uniqueness**: Each transaction has a unique `transaction_id` (UUID) for idempotency and deduplication.
+
+### JSON Structure
+
+```json
+{
+  "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+  "transaction_timestamp": "2026-05-02T14:30:00.000Z",
+  "transaction_amount": 125000.5,
+  "currency": "USD",
+  "transaction_type": "CREDIT",
+  "status": "COMPLETED",
+  "fund": {
+    "fund_id": 1,
+    "fund_name": "Fund A"
+  },
+  "deal": {
+    "deal_id": 2,
+    "deal_name": "Deal B"
+  },
+  "metadata": {
+    "source": "simulated-emitter",
+    "strategy": "growth"
+  }
+}
+```
+
+### Field Definitions
+
+| Field                   | Type              | Description                                             | Required |
+| ----------------------- | ----------------- | ------------------------------------------------------- | -------- |
+| `transaction_id`        | string (UUID)     | Unique identifier for the transaction                   | Yes      |
+| `transaction_timestamp` | string (ISO 8601) | When the transaction occurred (used for event ordering) | Yes      |
+| `transaction_amount`    | number (float)    | Transaction amount in specified currency                | Yes      |
+| `currency`              | string            | Currency code (e.g., USD, EUR)                          | Yes      |
+| `transaction_type`      | string            | Direction of cash flow: `DEBIT`, `CREDIT`, `REVERSAL`   | Yes      |
+| `status`                | string            | Processing status: `PENDING`, `COMPLETED`, `FAILED`     | Yes      |
+| `fund`                  | object            | Fund context: `fund_id` (int), `fund_name` (string)     | Yes      |
+| `deal`                  | object            | Deal context: `deal_id` (int), `deal_name` (string)     | Yes      |
+| `metadata`              | object            | Optional enrichment data (e.g., source, strategy)       | No       |
+
+### Schema Evolution
+
+New fields are added as optional to maintain backward compatibility. Consumers apply defaults for missing fields (e.g., `metadata` defaults to an empty object).
+
+**Spark Processing Strategy**: When reading events in PySpark, missing fields are handled with default values using functions like `coalesce()` or `.get()` with fallbacks. For example, a new `risk_factor` field defaults to 0.0 if absent.
+
+**State Table Design**: The canonical balance table includes columns for all possible event fields. Events without certain fields insert default values (e.g., NULL or 0) into the corresponding columns, ensuring consistent schema across all records.
 
 ## Project Structure
 
@@ -63,30 +139,12 @@ streaming-fund-balance-engine/
 
 ## What This Project Demonstrates
 
-- design of a scalable, loosely coupled pipeline for financial events
-- use of Kafka for durable event streaming and replayability
-- orchestration patterns using Airflow DAGs and task dependencies
+- Design of a scalable, loosely coupled pipeline for financial events
+- Use of Kafka for durable event streaming and replayability
+- Orchestration patterns using Airflow DAGs and task dependencies
 - Spark batch processing and stateful aggregation logic
-- how event-driven systems can support transactional state updates
-- ability to build a real-world data engineering solution end to end
-
-## Key Features
-
-- multi-fund transaction simulation
-- append-only event stream storage
-- batch orchestration with Airflow
-- Spark-based balance computation
-- canonical state management for fund balances
-- modular design for easy extension
-
-## Recommended Technologies
-
-- Apache Kafka
-- Apache Spark
-- Apache Airflow
-- Python (for emitter + orchestration)
-- Docker (optional for local deployment)
-- PostgreSQL / Delta Lake / parquet files for balance storage (optional)
+- How event-driven systems can support transactional state updates
+- Ability to build a real-world data engineering solution end to end
 
 ## Usage
 
@@ -100,13 +158,13 @@ streaming-fund-balance-engine/
 
 This repo is built to demonstrate strong data engineering skills in both architecture and implementation. It shows how to:
 
-- build reliable event-driven systems
-- connect streaming and batch processing patterns
-- manage orchestration and workflow dependencies
-- produce a strong technical story for data engineering interviews or portfolio presentations
+- Build reliable event-driven systems
+- Connect streaming and batch processing patterns
+- Manage orchestration and workflow dependencies
+- Produce a strong technical story for data engineering interviews or portfolio presentations
 
 ## Notes
 
-- The exact stack and deployment details may vary based on the repository’s implementation files.
+- The exact stack and deployment details may vary based on the repository's implementation files.
 - If Docker, Kubernetes, or cloud deployment are available, this project can be extended to show infrastructure orchestration as well.
 - Focus on the end-to-end flow from event generation to canonical balance update when presenting the project.
