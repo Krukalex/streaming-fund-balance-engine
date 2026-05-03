@@ -66,17 +66,3 @@ while True:
     producer.send("transactions", transaction)
     print(f"Produced: {transaction}")
     time.sleep(10)
-
-# # Example usage
-# if __name__ == "__main__":
-#     sample_transaction = Transaction(
-#         transaction_id=str(uuid.uuid4()),
-#         fund_id="FUND_001",
-#         fund_name="Tech Growth Fund",
-#         deal_id="DEAL_001",
-#         deal_name="Series A Investment",
-#         transaction_amount=Decimal("10000.00"),
-#         transaction_type=TransactionType.CREDIT,
-#         transaction_timestamp=datetime.utcnow()
-#     )
-#     print(sample_transaction.to_dict())
