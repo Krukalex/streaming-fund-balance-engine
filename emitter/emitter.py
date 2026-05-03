@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 import random
 import time
@@ -34,9 +34,12 @@ def generate_transaction() -> dict:
     fund = random.choice(funds)
     deal = random.choice(fund["deals"])
 
+    # Simulate transaction timestamp that is different than the event timestamp so that we can showcase event ordering
+    txn_time = datetime.utcnow() - timedelta(minutes=random.randint(0, 30))
     transaction = {
         "transaction_id": str(uuid.uuid4()),
-        "transaction_timestamp": datetime.utcnow().isoformat(),
+        "transaction_timestamp": txn_time.isoformat(),
+        "event_timestamp": datetime.utcnow().isoformat(),
         "transaction_amount": round(random.uniform(0, 1000000), 2),
         "currency": "USD",
         "transaction_type": random.choice(transaction_types),
