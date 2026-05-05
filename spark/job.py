@@ -1,10 +1,7 @@
-from pyspark.sql.functions import to_timestamp
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, row_number, desc, when, sum, count, max, min, coalesce, unix_timestamp, lit, to_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType, MapType
 from pyspark.sql.window import Window
-
-from pyspark.sql import SparkSession
 
 # Build Spark Session
 spark = SparkSession.builder \
@@ -104,7 +101,7 @@ filter_df = lagged_df.filter(col("ingest_delay_sec") <= 600)
 ordered_df = filter_df.orderBy("transaction_timestamp")
 
 # Calculate signed amounts based on transaction type
-signed_df = deduped_df.withColumn(
+signed_df = ordered_df.withColumn(
     "signed_amount",
     when(col("transaction_type") == "CREDIT", col("transaction_amount"))
     .when(col("transaction_type") == "DEBIT", -col("transaction_amount"))
