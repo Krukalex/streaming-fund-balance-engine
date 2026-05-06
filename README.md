@@ -20,21 +20,18 @@ This project demonstrates end-to-end data engineering skills, from event generat
 The system is built around four core components:
 
 1. **Event Emitter**
-   - Produces transaction events for multiple funds
-   - Sends events into Kafka topics for downstream processing
-
+  - Produces transaction events for multiple funds
+  - Sends events into Kafka topics for downstream processing
 2. **Kafka Stream**
-   - Serves as the event log and durable messaging backbone
-   - Maintains an ordered, replayable history of all transactions
-
+  - Serves as the event log and durable messaging backbone
+  - Maintains an ordered, replayable history of all transactions
 3. **Airflow Service**
-   - Orchestrates and schedules batch Spark jobs
-   - Demonstrates dependency management, retries, and monitoring
-
+  - Orchestrates and schedules batch Spark jobs
+  - Demonstrates dependency management, retries, and monitoring
 4. **Spark Processor**
-   - Consumes transaction event batches
-   - Processes events to update a canonical fund balance table
-   - Maintains state and supports incremental reconciliation
+  - Consumes transaction event batches
+  - Processes events to update a canonical fund balance table
+  - Maintains state and supports incremental reconciliation
 
 ## Key Features
 
@@ -44,6 +41,39 @@ The system is built around four core components:
 - Spark-based balance computation with idempotency and reconciliation
 - Canonical state management for fund balances
 - Modular design for easy extension and testing
+
+## Spark Processing Logic
+
+The Spark job processes Kafka transaction events into deterministic, auditable balance deltas for each fund/deal combination.
+
+1. **Read data from Kafka stream**
+  - Consume transaction events from Kafka and retain metadata (`topic`, `partition`, `offset`, `kafka_timestamp`) for traceability and deterministic tie-breaking.
+2. **Flatten into a DataFrame**
+  - Parse JSON payloads into a typed schema.
+  - Flatten nested `fund` and `deal` objects into top-level columns.
+  - Apply fallback handling for missing fields to support schema evolution.
+3. **Detect late arriving events**
+  - Compute transaction age using epoch-second comparison against `current_timestamp()`.
+  - Flag events older than 5 minutes into a dedicated late-arrival DataFrame.
+  - Persist these records to a run-metrics table for operational awareness.
+4. **Identify duplicate events**
+  - Treat any repeated `transaction_id` as a duplicate candidate.
+  - Resolve duplicates deterministically using descending `transaction_timestamp`, then descending `kafka_timestamp`, then descending `offset`.
+5. **Determine winning duplicate records**
+  - Rank records per `transaction_id` and keep the highest-ranked row as the winner.
+  - Persist winner metadata to an audit table to document why specific rows were retained.
+6. **Build duplicate summary diagnostics**
+  - Compute per-ID duplicate stats (`min transaction_timestamp`, `max transaction_timestamp`, `duplicate_count`).
+  - Join duplicate stats with winner metadata to create a complete duplicate summary.
+  - Persist this summary to a metrics/audit table for debugging and replay analysis.
+7. **Apply business signing logic**
+  - Convert transaction types into signed cash flow values:
+    - `DEBIT` -> positive amount
+    - `CREDIT` -> negative amount
+8. **Aggregate by fund and deal**
+  - Group by `fund_id` and `deal_id` to produce per-batch incremental net balance changes.
+9. **Upsert into canonical state table**
+  - Perform an idempotent upsert so retries do not double count and current balances remain correct.
 
 ## Event Schema
 
@@ -90,6 +120,7 @@ The event schema represents a financial transaction event in an investment fund 
 
 ### Field Definitions
 
+
 | Field                   | Type              | Description                                             | Required |
 | ----------------------- | ----------------- | ------------------------------------------------------- | -------- |
 | `transaction_id`        | string (UUID)     | Unique identifier for the transaction                   | Yes      |
@@ -101,6 +132,7 @@ The event schema represents a financial transaction event in an investment fund 
 | `fund`                  | object            | Fund context: `fund_id` (int), `fund_name` (string)     | Yes      |
 | `deal`                  | object            | Deal context: `deal_id` (int), `deal_name` (string)     | Yes      |
 | `metadata`              | object            | Optional enrichment data (e.g., source, strategy)       | No       |
+
 
 ### Schema Evolution
 
@@ -177,3 +209,4 @@ This repo is built to demonstrate strong data engineering skills in both archite
 - The exact stack and deployment details may vary based on the repository's implementation files.
 - If Docker, Kubernetes, or cloud deployment are available, this project can be extended to show infrastructure orchestration as well.
 - Focus on the end-to-end flow from event generation to canonical balance update when presenting the project.
+
