@@ -1,7 +1,8 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, row_number, desc, when, sum, count, max, min, coalesce, unix_timestamp, lit, to_timestamp
+from pyspark.sql.functions import from_json, col, row_number, desc, when, sum, count, max, min, coalesce, unix_timestamp, lit, to_timestamp, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType, MapType
 from pyspark.sql.window import Window
+from datetime import datetime
 
 # Build Spark Session
 spark = SparkSession.builder \
@@ -46,7 +47,14 @@ events_df = raw_df.selectExpr(
 
 # Parse event and add new column to raw_df for each event field
 parsed_df = events_df.withColumn(
-    "json", from_json(col("value"), schema)).select("json.*")
+    "json", from_json(col("value"), schema)).select(
+        "topic",
+        "partition",
+        "offset",
+        "kafka_timestamp",
+        "timestampType
+        "json.*"
+        )
 
 # Flatten fund and deal object
 # separate fund id and deal id into separate columns -> important for aggregations
@@ -66,8 +74,19 @@ flat_df = parsed_df.select(
     col("fund.fund_name").alias("fund_name"),
     col("deal.deal_id").alias("deal_id"),
     col("deal.deal_name").alias("deal_name"),
-    "metadata"
+    "metadata",
+    "kafka_timestamp",
+    "timestampType",
+    "offset",
+    "topic"
 )
+
+flat_df.show()
+
+# Detect late arriving events -> late arriving means that a transaction timestamp is more than 5 minutes before current time
+late_arriving_df = flat_df.filter( unix_timestamp(lit(current_timestamp())) - unix_timestamp(col("transaction_timestamp")) > 300) # 300 seconds = 5 minutes
+
+## OPEN: Need to add logic to log this into db somewhere ##
 
 # Detect if there are duplicate records in a batch
 duplicate_summary = flat_df.groupBy("transaction_id").agg(
@@ -89,19 +108,9 @@ deduped_df = flat_df.withColumn(
     "rn", row_number().over(window_spec)
 ).filter(col("rn") == 1).drop("rn")
 
-# Handle late arriving events
-lagged_df = deduped_df.withColumn("ingest_delay_sec", unix_timestamp(
-    "event_timestamp") - unix_timestamp("transaction_timestamp")
-)
-
-# Discard events that are more than 600 seconds old
-filter_df = lagged_df.filter(col("ingest_delay_sec") <= 600)
-
-# Ensure proper event order (for batch processing)
-ordered_df = filter_df.orderBy("transaction_timestamp")
 
 # Calculate signed amounts based on transaction type
-signed_df = ordered_df.withColumn(
+signed_df = deduped_df.withColumn(
     "signed_amount",
     when(col("transaction_type") == "CREDIT", col("transaction_amount"))
     .when(col("transaction_type") == "DEBIT", -col("transaction_amount"))
@@ -113,5 +122,5 @@ net_df = signed_df.groupBy("fund_id", "deal_id").agg(
     sum("signed_amount").alias("net_cash_flow")
 )
 
-net_df.show()
+# net_df.show()
 # Upsert into state table
