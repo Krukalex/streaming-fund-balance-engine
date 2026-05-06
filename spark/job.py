@@ -42,7 +42,8 @@ events_df = raw_df.selectExpr(
     "topic",
     "partition",
     "offset",
-    "timestamp"
+    "timestamp as kafka_timestamp",
+    "timestampType"
 )
 
 # Parse event and add new column to raw_df for each event field
@@ -52,7 +53,7 @@ parsed_df = events_df.withColumn(
         "partition",
         "offset",
         "kafka_timestamp",
-        "timestampType
+        "timestampType",
         "json.*"
         )
 
@@ -84,30 +85,51 @@ flat_df = parsed_df.select(
 flat_df.show()
 
 # Detect late arriving events -> late arriving means that a transaction timestamp is more than 5 minutes before current time
-late_arriving_df = flat_df.filter( unix_timestamp(lit(current_timestamp())) - unix_timestamp(col("transaction_timestamp")) > 300) # 300 seconds = 5 minutes
-
-## OPEN: Need to add logic to log this into db somewhere ##
-
-# Detect if there are duplicate records in a batch
-duplicate_summary = flat_df.groupBy("transaction_id").agg(
-    count("*").alias("duplicate_count"),
-    max("transaction_timestamp").alias("latest_timestamp"),
-    min("transaction_timestamp").alias("earliest_timestamp")
+df_with_lag = flat_df.withColumn(
+    "txn_age_sec",
+    unix_timestamp(current_timestamp()) - unix_timestamp(col("transaction_timestamp"))
 )
 
-duplicates = duplicate_summary.filter(col("duplicate_count") > 1)
+late_arriving_df = df_with_lag.filter(col("txn_age_sec") > 300)
 
 ## OPEN: Need to add logic to log this into db somewhere ##
 
 
-# Deduplicate: keep the most recent transaction
-window_spec = Window.partitionBy("transaction_id").orderBy(
-    desc("transaction_timestamp"))
+# Deduplicate: keep the most recent transaction. Use kafka_timestamp and offset to break ties.
+winner_window = Window.partitionBy("transaction_id").orderBy(
+    desc("transaction_timestamp"),
+    desc("kafka_timestamp"),
+    desc("offset")
+)
 
-deduped_df = flat_df.withColumn(
-    "rn", row_number().over(window_spec)
-).filter(col("rn") == 1).drop("rn")
+# Rank rows per transaction_id
+ranked_df = df_with_lag.withColumn("rn", row_number().over(winner_window))
 
+# Create a deduplicted df with only the winning rows for further processing
+deduped_df = ranked_df.filter(col("rn")==1)
+
+# Winner row per transaction_id (single source of truth)
+winners_df = ranked_df.filter(col("rn") == 1).select(
+    "transaction_id",
+    col("transaction_timestamp").alias("winner_transaction_timestamp"),
+    col("kafka_timestamp").alias("winner_kafka_timestamp"),
+    col("offset").alias("winner_offset"),
+    col("topic").alias("winner_topic")
+)
+# Aggregate duplicate diagnostics
+duplicate_stats_df = df_with_lag.groupBy("transaction_id").agg(
+    count("*").alias("duplicate_count"),
+    min("transaction_timestamp").alias("earliest_timestamp"),
+    max("transaction_timestamp").alias("latest_timestamp")
+)
+# Final duplicate summary (only ids with actual duplicates)
+duplicate_summary = (
+    duplicate_stats_df
+    .join(winners_df, on="transaction_id", how="left")
+    .filter(col("duplicate_count") > 1)
+)
+
+## OPEN: Need to add logic to log this into db somewhere ##
 
 # Calculate signed amounts based on transaction type
 signed_df = deduped_df.withColumn(
