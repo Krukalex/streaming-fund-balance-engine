@@ -82,8 +82,6 @@ flat_df = parsed_df.select(
     "topic"
 )
 
-flat_df.show()
-
 # Detect late arriving events -> late arriving means that a transaction timestamp is more than 5 minutes before current time
 df_with_lag = flat_df.withColumn(
     "txn_age_sec",
@@ -144,5 +142,5 @@ net_df = signed_df.groupBy("fund_id", "deal_id").agg(
     sum("signed_amount").alias("net_cash_flow")
 )
 
-# net_df.show()
+net_df.show()
 # Upsert into state table
