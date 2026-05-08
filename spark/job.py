@@ -3,6 +3,50 @@ from pyspark.sql.functions import from_json, col, row_number, desc, when, sum, c
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType, MapType
 from pyspark.sql.window import Window
 from datetime import datetime
+from pyspark import SparkContext
+# import java
+
+# Define JDBC connection details for postgres
+jdbc_url = "jdbc:postgresql://postgres:5432/fund_balance"
+jdbc_props = {
+    "user": "funduser",
+    "password": "fundpass",
+    "driver": "org.postgresql.Driver"
+}
+
+
+## Next items -> need to make upsert idempotent ##
+# 1) add a transaction ledger table in postgres and upsert into that. This will maintain a canonical history of unique transaction ids
+# 2) do an upsert from the transaction ledger rather than the staging table into the transaction balance table. this will use the cumulative sum of transactions from the beginning, making it fully idempotent
+
+
+# Upsert transaction balance into postgres
+def upsert_transaction_balance(df, jdbc_url, jdbc_props):
+    # Write to staging table
+    df.write.jdbc(url=jdbc_url, table="transaction_balance_staging", mode="overwrite", properties=jdbc_props)
+
+    # Upsert into canonical table
+    sql_text = """
+    INSERT INTO transaction_balance (fund_id, deal_id, balance, last_modified)
+    select fund_id, deal_id, net_cash_flow, now() from transaction_balance_staging
+    ON CONFLICT (fund_id, deal_id) DO UPDATE SET
+    balance = transaction_balance.balance + EXCLUDED.balance,
+    last_modified = EXCLUDED.last_modified
+    """
+
+    # Upsert into canonical table
+    gateway = SparkContext._gateway
+    java_import = gateway.jvm.java.lang.Class
+    driver_manager = gateway.jvm.java.sql.DriverManager
+    conn = driver_manager.getConnection(jdbc_url, jdbc_props["user"], jdbc_props["password"])
+    try:
+        stmt = conn.createStatement()
+        stmt.executeUpdate(sql_text)
+        stmt.executeUpdate("DROP TABLE IF EXISTS transaction_balance_staging")
+        stmt.close()
+    finally:
+        conn.close()
+
 
 # Build Spark Session
 spark = SparkSession.builder \
@@ -79,7 +123,8 @@ flat_df = parsed_df.select(
     "kafka_timestamp",
     "timestampType",
     "offset",
-    "topic"
+    "topic",
+    "partition"
 )
 
 # Detect late arriving events -> late arriving means that a transaction timestamp is more than 5 minutes before current time
@@ -142,5 +187,5 @@ net_df = signed_df.groupBy("fund_id", "deal_id").agg(
     sum("signed_amount").alias("net_cash_flow")
 )
 
-net_df.show()
 # Upsert into state table
+upsert_transaaction_balance(net_df, jdbc_url, jdbc_props)

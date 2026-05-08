@@ -77,49 +77,50 @@ The Spark job processes Kafka transaction events into deterministic, auditable b
 
 ## PostgreSQL schema
 
-PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, and **drill-down logs**. Pipeline runs should carry a stable **`run_id`** (typically one Airflow/Spark invocation) for correlation across tables.
+PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, and **drill-down logs**. Pipeline runs should carry a stable `**run_id`** (typically one Airflow/Spark invocation) for correlation across tables.
 
 ### Tables and grain
 
-| Table                     | Grain / identity | Purpose |
-| ------------------------- | ---------------- | ------- |
-| `transaction_balance`     | `(fund_id, deal_id)` | Current net balance per fund/deal pair. |
-| `run_metrics`             | `run_id` | One row per pipeline run: volumes and quality counts. |
-| `duplicate_records_log` | **Surrogate PK** + unique `(run_id, transaction_id)` | Duplicate groups for that run: counts, min/max business time, and full Kafka pointer for the retained winner. |
+
+| Table                     | Grain / identity                                                         | Purpose                                                                                                                       |
+| ------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `transaction_balance`     | `(fund_id, deal_id)`                                                     | Current net balance per fund/deal pair.                                                                                       |
+| `run_metrics`             | `run_id`                                                                 | One row per pipeline run: volumes and quality counts.                                                                         |
+| `duplicate_records_log`   | **Surrogate PK** + unique `(run_id, transaction_id)`                     | Duplicate groups for that run: counts, min/max business time, and full Kafka pointer for the retained winner.                 |
 | `late_arriving_event_log` | **Surrogate PK** + unique `(kafka_topic, kafka_partition, kafka_offset)` | One durable row per **physical Kafka message** flagged late; survives retries, backfills, and replays without double inserts. |
+
 
 ### Idempotent surrogate keys (SHA-256, 64-char lowercase hex)
 
-Both log tables use a **`surrogate_pk`** primary key computed in Spark as **`sha256(..., 256)`** (hex) over a UTF-8 string with fixed prefixes so key spaces never collide:
+Both log tables use a `**surrogate_pk`** primary key computed in Spark as `**sha256(..., 256)`** (hex) over a UTF-8 string with fixed prefixes so key spaces never collide:
 
-- **`duplicate_records_log.surrogate_pk`**: hash the UTF-8 literal string ``DUP|{run_id}|{transaction_id}`` (exact `|` separators; keep `run_id` / `transaction_id` consistent with what you write to the row). Same **`run_id`** + same **`transaction_id`** always maps to one row, so retries of the **same** run are idempotent.
-
-- **`late_arriving_event_log.surrogate_pk`**: hash the UTF-8 literal string ``LATE|{kafka_topic}|{partition}|{offset}``, with **`partition`** and **`offset`** as decimal integers (no zero-padding). Identity is **the Kafka coordinate**, not **`transaction_id`**, so replaying the same message always hits the same key even if **`transaction_id` appears across multiple runs**.
+- `**duplicate_records_log.surrogate_pk`**: hash the UTF-8 literal string `DUP|{run_id}|{transaction_id}` (exact `|` separators; keep `run_id` / `transaction_id` consistent with what you write to the row). Same `**run_id`** + same `**transaction_id**` always maps to one row, so retries of the **same** run are idempotent.
+- `**late_arriving_event_log.surrogate_pk`**: hash the UTF-8 literal string `LATE|{kafka_topic}|{partition}|{offset}`, with `**partition`** and `**offset**` as decimal integers (no zero-padding). Identity is the Kafka coordinate, not `**transaction_id**`, so replaying the same message always hits the same key even if `**transaction_id` appears across multiple runs**.
 
 **Database constraints:** DDL adds **unique indexes** on the natural tuples above as well (`duplicate_records_identity_uq`, `late_arriving_event_kafka_uq`) so ingestion bugs cannot silently diverge surrogate vs physical identity.
 
-**`transaction_balance`**
+`**transaction_balance`**
 
 - `fund_id`, `deal_id` — natural key (identifiers only; names live on events / dimensions, not on state).
 - `balance` — current net balance after applied signed movements.
 - `last_modified` — when this row was last updated by the job.
 
-**`run_metrics`**
+`**run_metrics`**
 
 - `record_count` — rows considered in the run after parsing (aligned with Spark’s batch scope).
-- `duplicate_count` — number of **`transaction_id`s that had duplicates** in that run; should match **`SELECT COUNT(*) FROM duplicate_records_log WHERE run_id = ?`** after a successful load.
+- `duplicate_count` — number of `**transaction_id`s that had duplicates** in that run; should match `**SELECT COUNT(*) FROM duplicate_records_log WHERE run_id = ?`** after a successful load.
 - `late_arrival_count` — number of events flagged late **in this run’s batch** (Spark count). It may not equal `COUNT(*) FROM late_arriving_event_log WHERE run_id = ?` because late rows are keyed by **Kafka coordinates** and may have been inserted under an earlier replay; use this field as the run’s **observed** late volume, not as a strict join key to the log.
 - `run_timestamp` — when the run was recorded (e.g. job start or completion).
 
-**`duplicate_records_log`**
+`**duplicate_records_log`**
 
-Winner metadata includes **`winner_partition`** and **`winner_offset`** (with **`winner_topic`**) so the chosen message can be relocated in Kafka independently of other ties.
+Winner metadata includes `**winner_partition`** and `**winner_offset`** (with `**winner_topic`**) so the chosen message can be relocated in Kafka independently of other ties.
 
-**`late_arriving_event_log`**
+`**late_arriving_event_log`**
 
-- **`txn_age_sec`** — arrival delay / staleness metric: same definition as Spark’s **`txn_age_sec`**, namely `unix_timestamp(current_timestamp) - unix_timestamp(transaction_timestamp)` at processing time for that run (seconds). This column is persisted for SLA reporting without recomputing from timestamps.
+- `**txn_age_sec**` — arrival delay / staleness metric: same definition as Spark’s `**txn_age_sec**`, namely `unix_timestamp(current_timestamp) - unix_timestamp(transaction_timestamp)` at processing time for that run (seconds). This column is persisted for SLA reporting without recomputing from timestamps.
 
-DDL for these objects lives in **`db/init.sql`**.
+DDL for these objects lives in `**db/init.sql**`.
 
 ## Event Schema
 
@@ -186,7 +187,7 @@ New fields are added as optional to maintain backward compatibility. Consumers a
 
 **Spark Processing Strategy**: When reading events in PySpark, missing fields are handled with default values using functions like `coalesce()` or `.get()` with fallbacks. For example, a new `risk_factor` field defaults to 0.0 if absent.
 
-**State Table Design**: `transaction_balance` stores only `**fund_id`**, `**deal_id**`, `**balance**`, and `**last_modified**` so the ledger state stays narrow and authoritative; enrichment (names, metadata) stays on raw events or drill-down logs.
+**State Table Design**: `transaction_balance` stores only `**fund_id`**, `**deal_id`**, `**balance**`, and `**last_modified**` so the ledger state stays narrow and authoritative; enrichment (names, metadata) stays on raw events or drill-down logs.
 
 ## Project Structure
 
@@ -232,10 +233,21 @@ Download these JARs into `./jars` before running Docker Compose:
 - [spark-token-provider-kafka-0-10_2.12-3.5.1.jar](https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.1/spark-token-provider-kafka-0-10_2.12-3.5.1.jar)
 - [kafka-clients-3.4.0.jar](https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.0/kafka-clients-3.4.0.jar)
 - [commons-pool2-2.11.1.jar](https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar)
+- [postgresql-42.7.3.jar](https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar) (JDBC driver for writing to PostgreSQL from Spark)
+
+### Connecting Spark to PostgreSQL
+
+`docker-compose.yml` starts PostgreSQL with database `**fund_balance`**, user `**funduser`**, password `**fundpass**`, and applies `**db/init.sql**` on first data volume creation.
+
+- **Spark runs inside the Compose network** (e.g. `spark-submit` from `spark-master`): use host `**postgres`**, port `**5432`**:
+`jdbc:postgresql://postgres:5432/fund_balance`
+- **Spark runs on your host machine** (IDE / local `spark-submit`): use `**localhost:5432`** (same URL path and credentials).
+
+Put the PostgreSQL JAR in `./jars` (already on Spark’s extra classpath via Compose). In PySpark, use `format("jdbc")` with `.option("url", url)`, `.option("dbtable", table)`, `.option("user", "funduser")`, `.option("password", "fundpass")`, and for upserts use `foreachBatch` with JDBC or stage via temp table + SQL `ON CONFLICT` (implementation detail for a later change).
 
 ## Usage
 
-1. Start Kafka and any required services
+1. From the repo root: `docker compose -f docker/docker-compose.yml up -d` (starts Kafka, PostgreSQL, Spark master/worker, and related services)
 2. Run the event emitter to publish transaction messages
 3. Start Airflow and enable the DAG for batch processing
 4. Execute the Spark job to process events and update balances
