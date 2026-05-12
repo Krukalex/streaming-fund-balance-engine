@@ -32,7 +32,11 @@ def execute_sql(sql_text, jdbc_url, jdbc_props):
 # Upsert transaction balance into postgres
 def upsert_transaction_ledger(df, jdbc_url, jdbc_props):
     # Write to staging table
-    df.write.jdbc(url=jdbc_url, table="transaction_ledger_staging", mode="overwrite", properties=jdbc_props)
+    try:
+        df.write.jdbc(url=jdbc_url, table="transaction_ledger_staging", mode="overwrite", properties=jdbc_props)
+    except Exception as e:
+        execute_sql("DROP TABLE IF EXISTS transaction_ledger_staging", jdbc_url, jdbc_props)
+        raise RuntimeError(f"Staging write failed: {e}") from e
 
     # Upsert into canonical table
     sql_text = """
@@ -44,10 +48,10 @@ def upsert_transaction_ledger(df, jdbc_url, jdbc_props):
                 signed_amount, 
                 fund_id, 
                 deal_id, 
-                kafka_timestamp, 
-                partition, 
-                offset, 
-                topic,
+                kafka_timestamp,
+                kafka_partition,
+                kafka_offset,
+                kafka_topic,
                 now() 
             from transaction_ledger_staging
         ON CONFLICT (transaction_id) DO NOTHING
@@ -226,10 +230,12 @@ ledger_df = signed_df.select(
     "fund_id",
     "deal_id",
     "kafka_timestamp",
-    "partition",
-    "offset",
-    "topic"
+    col("partition").alias("kafka_partition"),
+    col("offset").alias("kafka_offset"),
+    col("topic").alias("kafka_topic")
 )
+
+ledger_df.show()
 
 
 # Upsert into transaction ledger table

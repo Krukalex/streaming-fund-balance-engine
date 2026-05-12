@@ -21,9 +21,9 @@ CREATE TABLE IF NOT EXISTS transaction_ledger (
     kafka_offset BIGINT NOT NULL,
     kafka_topic VARCHAR(256) NOT NULL,
     last_modified TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (transaction_id),
     CONSTRAINT transaction_ledger_kafka_uq UNIQUE (kafka_topic, kafka_partition, kafka_offset)
 );
+
 
 CREATE TABLE IF NOT EXISTS run_metrics (
     run_id VARCHAR(128) PRIMARY KEY,
