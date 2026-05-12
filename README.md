@@ -118,9 +118,9 @@ Winner metadata includes `**winner_partition`** and `**winner_offset`** (with `*
 
 `**late_arriving_event_log`**
 
-- `**txn_age_sec**` — arrival delay / staleness metric: same definition as Spark’s `**txn_age_sec**`, namely `unix_timestamp(current_timestamp) - unix_timestamp(transaction_timestamp)` at processing time for that run (seconds). This column is persisted for SLA reporting without recomputing from timestamps.
+- `**txn_age_sec`** — arrival delay / staleness metric: same definition as Spark’s `**txn_age_sec`**, namely `unix_timestamp(current_timestamp) - unix_timestamp(transaction_timestamp)` at processing time for that run (seconds). This column is persisted for SLA reporting without recomputing from timestamps.
 
-DDL for these objects lives in `**db/init.sql**`.
+DDL for these objects lives in `**db/init.sql`**.
 
 ## Event Schema
 

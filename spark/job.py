@@ -15,26 +15,9 @@ jdbc_props = {
 }
 
 
-## Next items -> need to make upsert idempotent ##
-# 1) add a transaction ledger table in postgres and upsert into that. This will maintain a canonical history of unique transaction ids
-# 2) do an upsert from the transaction ledger rather than the staging table into the transaction balance table. this will use the cumulative sum of transactions from the beginning, making it fully idempotent
 
-
-# Upsert transaction balance into postgres
-def upsert_transaction_balance(df, jdbc_url, jdbc_props):
-    # Write to staging table
-    df.write.jdbc(url=jdbc_url, table="transaction_balance_staging", mode="overwrite", properties=jdbc_props)
-
-    # Upsert into canonical table
-    sql_text = """
-    INSERT INTO transaction_balance (fund_id, deal_id, balance, last_modified)
-    select fund_id, deal_id, net_cash_flow, now() from transaction_balance_staging
-    ON CONFLICT (fund_id, deal_id) DO UPDATE SET
-    balance = transaction_balance.balance + EXCLUDED.balance,
-    last_modified = EXCLUDED.last_modified
-    """
-
-    # Upsert into canonical table
+# Reusable function to execute sql statement
+def execute_sql(sql_text, jdbc_url, jdbc_props):
     gateway = SparkContext._gateway
     java_import = gateway.jvm.java.lang.Class
     driver_manager = gateway.jvm.java.sql.DriverManager
@@ -42,10 +25,62 @@ def upsert_transaction_balance(df, jdbc_url, jdbc_props):
     try:
         stmt = conn.createStatement()
         stmt.executeUpdate(sql_text)
-        stmt.executeUpdate("DROP TABLE IF EXISTS transaction_balance_staging")
         stmt.close()
     finally:
         conn.close()
+
+# Upsert transaction balance into postgres
+def upsert_transaction_ledger(df, jdbc_url, jdbc_props):
+    # Write to staging table
+    df.write.jdbc(url=jdbc_url, table="transaction_ledger_staging", mode="overwrite", properties=jdbc_props)
+
+    # Upsert into canonical table
+    sql_text = """
+        INSERT INTO 
+            transaction_ledger (transaction_id, transaction_timestamp, transaction_amount, fund_id, deal_id, kafka_timestamp, kafka_partition, kafka_offset, kafka_topic, last_modified)
+            select 
+                transaction_id, 
+                transaction_timestamp, 
+                signed_amount, 
+                fund_id, 
+                deal_id, 
+                kafka_timestamp, 
+                partition, 
+                offset, 
+                topic,
+                now() 
+            from transaction_ledger_staging
+        ON CONFLICT (transaction_id) DO NOTHING
+    """
+
+    # Upsert into canonical table
+    execute_sql(sql_text, jdbc_url, jdbc_props)
+
+    # Drop staging table
+    execute_sql("DROP TABLE IF EXISTS transaction_ledger_staging", jdbc_url, jdbc_props)
+
+def upsert_transaction_balance(jdbc_url, jdbc_props):
+    # Upsert into canonical table
+    sql_text = """
+        INSERT 
+            INTO transaction_balance (fund_id, deal_id, balance, last_modified)
+            SELECT 
+                fund_id, 
+                deal_id, 
+                SUM(transaction_amount), 
+                NOW()
+            FROM transaction_ledger
+        GROUP BY 
+            fund_id, 
+            deal_id
+        ON CONFLICT (fund_id, deal_id)
+        DO UPDATE SET
+            balance = EXCLUDED.balance,
+            last_modified = NOW()
+    """
+
+    # Upsert into canonical table
+    execute_sql(sql_text, jdbc_url, jdbc_props)
 
 
 # Build Spark Session
@@ -63,11 +98,11 @@ schema = StructType([
     StructField("transaction_type", StringType(), False),
     StructField("status", StringType(), False),
     StructField("fund", StructType([
-        StructField("fund_id", IntegerType(), False),
+        StructField("fund_id", StringType(), False),
         StructField("fund_name", StringType(), False),
     ]), False),
     StructField("deal", StructType([
-        StructField("deal_id", IntegerType(), False),
+        StructField("deal_id", StringType(), False),
         StructField("deal_name", StringType(), False),
     ]), False),
     StructField("metadata", MapType(StringType(), StringType()), True),
@@ -152,10 +187,11 @@ ranked_df = df_with_lag.withColumn("rn", row_number().over(winner_window))
 deduped_df = ranked_df.filter(col("rn")==1)
 
 # Winner row per transaction_id (single source of truth)
-winners_df = ranked_df.filter(col("rn") == 1).select(
+winners_df = deduped_df.select(
     "transaction_id",
     col("transaction_timestamp").alias("winner_transaction_timestamp"),
     col("kafka_timestamp").alias("winner_kafka_timestamp"),
+    col("partition").alias("winner_partition"),
     col("offset").alias("winner_offset"),
     col("topic").alias("winner_topic")
 )
@@ -182,10 +218,22 @@ signed_df = deduped_df.withColumn(
     .otherwise(0)  # handle REVERSAL or other types
 )
 
-# Aggregate net cash flow by fund and deal
-net_df = signed_df.groupBy("fund_id", "deal_id").agg(
-    sum("signed_amount").alias("net_cash_flow")
+# Select subset of columns to be used for transaction subledger
+ledger_df = signed_df.select(
+    "transaction_id",
+    "transaction_timestamp",
+    "signed_amount",
+    "fund_id",
+    "deal_id",
+    "kafka_timestamp",
+    "partition",
+    "offset",
+    "topic"
 )
 
-# Upsert into state table
-upsert_transaaction_balance(net_df, jdbc_url, jdbc_props)
+
+# Upsert into transaction ledger table
+upsert_transaction_ledger(ledger_df, jdbc_url, jdbc_props)
+
+# Udempotent upsert of transaction ledger into stage table
+upsert_transaction_balance(jdbc_url, jdbc_props)
