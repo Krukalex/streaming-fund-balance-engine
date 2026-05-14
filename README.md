@@ -53,9 +53,9 @@ The Spark job processes Kafka transaction events into deterministic, auditable b
   - Flatten nested `fund` and `deal` objects into top-level columns.
   - Apply fallback handling for missing fields to support schema evolution.
 3. **Detect late arriving events**
-  - Compute transaction age using epoch-second comparison against `current_timestamp()`.
-  - Flag events older than 5 minutes into a dedicated late-arrival DataFrame.
-  - Persist those rows to the **late arriving event log** table; rollup counts go to `**run_metrics`**.
+  - Define **late** as **ingest lag**: how long after the business-time `transaction_timestamp` the record appeared in Kafka, using epoch seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`.
+  - Flag rows where ingest lag exceeds a fixed threshold (e.g. **900 seconds**); the same message always yields the same lag on replay, unlike comparisons to `current_timestamp()`.
+  - Rows that qualify are written to `**late_arriving_event_log`**; each pipeline run also records how many late rows were observed in that run’s batch in `**run_metrics`** (see [Late arriving events (design)](#late-arriving-events-design)).
 4. **Identify duplicate events**
   - Treat any repeated `transaction_id` as a duplicate candidate.
   - Resolve duplicates deterministically using descending `transaction_timestamp`, then descending `kafka_timestamp`, then descending `offset`.
@@ -74,6 +74,34 @@ The Spark job processes Kafka transaction events into deterministic, auditable b
   - Group by `fund_id` and `deal_id` to produce per-batch incremental net balance changes.
 9. **Upsert into canonical state table**
   - Perform an idempotent upsert so retries do not double count and current balances remain correct.
+
+## Late arriving events (design)
+
+This section records the product and replay semantics for **late** detection and logging. It matches incremental, offset-based batches (each run processes only new Kafka data since the last successful commit).
+
+### Definition of “late”
+
+A record is treated as **late for observability** when **ingest lag** exceeds a configured threshold:
+
+- **Ingest lag (seconds)** = `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`
+- `**kafka_timestamp`** is the timestamp from the Spark Kafka source for that message (broker metadata).
+- `**transaction_timestamp`** is the business event time from the payload.
+
+This definition is **stable across replays**: reprocessing the same message recomputes the **same** lag, so a batch replay does not reinterpret “late” using wall-clock time at replay.
+
+### Surrogate primary key and idempotent log writes
+
+Each row in `**late_arriving_event_log`** is keyed by a **deterministic `surrogate_pk`**: a SHA-256 hex string over a fixed UTF-8 literal that includes the **physical Kafka identity** — `**topic`**, `**partition`**, and `**offset**` — in a single documented order (e.g. `LATE|{topic}|{partition}|{offset}` with `|` separators). That identity is stable for the life of the message in the log.
+
+Inserts use `**ON CONFLICT (surrogate_pk) DO NOTHING**`: the **first** successful write wins; replays and retries do **not** replace or duplicate the observability row. That preserves “what we thought when we first persisted this late message.”
+
+### Run metrics vs log cardinality
+
+`**run_metrics.late_arrival_count`** (or an equivalently named column) is the count of messages **in the current batch slice** that satisfy the late predicate **in Spark**, computed every time the job runs — including replays of the same offset range. That number answers: *“this execution observed n late messages in its input.”* It is **not** required to equal the number of **new** rows appended to `**late_arriving_event_log`** on that attempt (replays often append **zero** new rows because of `DO NOTHING`). Document both meanings in dashboards if you expose both.
+
+### Why not `current_timestamp()` − `transaction_timestamp`?
+
+Comparing business time to **job wall clock** changes every time you run or replay a job, so old batches can incorrectly inflate “late” over time. Ingest lag ties late-ness to **when the message actually landed in Kafka** relative to the business event, which is the usual operational reading for pipeline delay.
 
 ## PostgreSQL schema
 
@@ -94,8 +122,8 @@ PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, an
 
 Both log tables use a `**surrogate_pk`** primary key computed in Spark as `**sha256(..., 256)`** (hex) over a UTF-8 string with fixed prefixes so key spaces never collide:
 
-- `**duplicate_records_log.surrogate_pk`**: hash the UTF-8 literal string `DUP|{run_id}|{transaction_id}` (exact `|` separators; keep `run_id` / `transaction_id` consistent with what you write to the row). Same `**run_id`** + same `**transaction_id**` always maps to one row, so retries of the **same** run are idempotent.
-- `**late_arriving_event_log.surrogate_pk`**: hash the UTF-8 literal string `LATE|{kafka_topic}|{partition}|{offset}`, with `**partition`** and `**offset**` as decimal integers (no zero-padding). Identity is the Kafka coordinate, not `**transaction_id**`, so replaying the same message always hits the same key even if `**transaction_id` appears across multiple runs**.
+- `**duplicate_records_log.surrogate_pk**`: hash the UTF-8 literal string `DUP|{run_id}|{transaction_id}` (exact `|` separators; keep `run_id` / `transaction_id` consistent with what you write to the row). Same `**run_id**` + same `**transaction_id**` always maps to one row, so retries of the **same** run are idempotent.
+- `**late_arriving_event_log.surrogate_pk`**: hash the UTF-8 literal string `LATE|{kafka_topic}|{partition}|{offset}`, with `**partition`** and `**offset**` as decimal integers (no zero-padding). Identity is the Kafka coordinate, not `**transaction_id**`, so replaying the same message always hits the same key even if `**transaction_id**` appears across multiple runs.
 
 **Database constraints:** DDL adds **unique indexes** on the natural tuples above as well (`duplicate_records_identity_uq`, `late_arriving_event_kafka_uq`) so ingestion bugs cannot silently diverge surrogate vs physical identity.
 
@@ -108,17 +136,17 @@ Both log tables use a `**surrogate_pk`** primary key computed in Spark as `**sha
 `**run_metrics`**
 
 - `record_count` — rows considered in the run after parsing (aligned with Spark’s batch scope).
-- `duplicate_count` — number of `**transaction_id`s that had duplicates** in that run; should match `**SELECT COUNT(*) FROM duplicate_records_log WHERE run_id = ?`** after a successful load.
-- `late_arrival_count` — number of events flagged late **in this run’s batch** (Spark count). It may not equal `COUNT(*) FROM late_arriving_event_log WHERE run_id = ?` because late rows are keyed by **Kafka coordinates** and may have been inserted under an earlier replay; use this field as the run’s **observed** late volume, not as a strict join key to the log.
+- `duplicate_count` — number of distinct `**transaction_id**` values that had duplicates in that run; should match `SELECT COUNT(*) FROM duplicate_records_log WHERE run_id = ?` after a successful load.
+- `late_arrival_count` — number of messages in **this run’s batch** that satisfied the ingest-lag late rule in Spark (**observed in batch**), recorded on every execution including replays. It does **not** necessarily equal the number of **new** rows inserted into `late_arriving_event_log` on that attempt (replay with `ON CONFLICT DO NOTHING` on `surrogate_pk` typically inserts zero duplicate log rows).
 - `run_timestamp` — when the run was recorded (e.g. job start or completion).
 
 `**duplicate_records_log`**
 
-Winner metadata includes `**winner_partition`** and `**winner_offset`** (with `**winner_topic`**) so the chosen message can be relocated in Kafka independently of other ties.
+Winner metadata includes `**winner_partition`** and `**winner_offset**` (with `**winner_topic**`) so the chosen message can be relocated in Kafka independently of other ties.
 
-`**late_arriving_event_log`**
+`**late_arriving_event_log**`
 
-- `**txn_age_sec`** — arrival delay / staleness metric: same definition as Spark’s `**txn_age_sec`**, namely `unix_timestamp(current_timestamp) - unix_timestamp(transaction_timestamp)` at processing time for that run (seconds). This column is persisted for SLA reporting without recomputing from timestamps.
+- `**txn_age_sec**` (or the column name in DDL) — persisted **ingest lag** in seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`, matching the Spark late rule. See [Late arriving events (design)](#late-arriving-events-design).
 
 DDL for these objects lives in `**db/init.sql`**.
 

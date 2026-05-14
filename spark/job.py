@@ -1,10 +1,14 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, row_number, desc, when, sum, count, max, min, coalesce, unix_timestamp, lit, to_timestamp, current_timestamp
+from pyspark.sql.functions import from_json, col, row_number, desc, when, sum, count, max, min, coalesce, unix_timestamp, lit, to_timestamp, current_timestamp, sha2, concat_ws
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType, MapType
 from pyspark.sql.window import Window
 from datetime import datetime
 from pyspark import SparkContext
-# import java
+from uuid import uuid4
+
+
+run_id = str(uuid4()).replace("-", "_")
+print(f"RUN ID: {run_id}")
 
 # Define JDBC connection details for postgres
 jdbc_url = "jdbc:postgresql://postgres:5432/fund_balance"
@@ -31,37 +35,30 @@ def execute_sql(sql_text, jdbc_url, jdbc_props):
 
 # Upsert transaction balance into postgres
 def upsert_transaction_ledger(df, jdbc_url, jdbc_props):
-    # Write to staging table
-    try:
-        df.write.jdbc(url=jdbc_url, table="transaction_ledger_staging", mode="overwrite", properties=jdbc_props)
-    except Exception as e:
-        execute_sql("DROP TABLE IF EXISTS transaction_ledger_staging", jdbc_url, jdbc_props)
-        raise RuntimeError(f"Staging write failed: {e}") from e
-
-    # Upsert into canonical table
     sql_text = """
-        INSERT INTO 
+        INSERT INTO
             transaction_ledger (transaction_id, transaction_timestamp, transaction_amount, fund_id, deal_id, kafka_timestamp, kafka_partition, kafka_offset, kafka_topic, last_modified)
-            select 
-                transaction_id, 
-                transaction_timestamp, 
-                signed_amount, 
-                fund_id, 
-                deal_id, 
+            select
+                transaction_id,
+                transaction_timestamp,
+                signed_amount,
+                fund_id,
+                deal_id,
                 kafka_timestamp,
                 kafka_partition,
                 kafka_offset,
                 kafka_topic,
-                now() 
+                now()
             from transaction_ledger_staging
         ON CONFLICT (transaction_id) DO NOTHING
     """
-
-    # Upsert into canonical table
-    execute_sql(sql_text, jdbc_url, jdbc_props)
-
-    # Drop staging table
-    execute_sql("DROP TABLE IF EXISTS transaction_ledger_staging", jdbc_url, jdbc_props)
+    try:
+        df.write.jdbc(url=jdbc_url, table="transaction_ledger_staging", mode="overwrite", properties=jdbc_props)
+        execute_sql(sql_text, jdbc_url, jdbc_props)
+    except Exception:
+        raise
+    finally:
+        execute_sql("DROP TABLE IF EXISTS transaction_ledger_staging", jdbc_url, jdbc_props)
 
 def upsert_transaction_balance(jdbc_url, jdbc_props):
     # Upsert into canonical table
@@ -85,6 +82,43 @@ def upsert_transaction_balance(jdbc_url, jdbc_props):
 
     # Upsert into canonical table
     execute_sql(sql_text, jdbc_url, jdbc_props)
+
+
+# Upsert late arriving event log into postgres
+def upsert_late_arriving_events(df, jdbc_url, jdbc_props):
+    sql_text = """
+        INSERT INTO
+            late_arriving_event_log (surrogate_pk, run_id, transaction_id, txn_age_sec, transaction_timestamp, event_timestamp, transaction_amount, currency, transaction_type, status, fund_id, fund_name, deal_id, deal_name, kafka_timestamp, kafka_partition, kafka_offset, kafka_topic)
+            select
+                surrogate_pk,
+                run_id,
+                transaction_id,
+                txn_age_sec,
+                transaction_timestamp,
+                event_timestamp,
+                transaction_amount,
+                currency,
+                transaction_type,
+                status,
+                fund_id,
+                fund_name,
+                deal_id,
+                deal_name,
+                kafka_timestamp,
+                kafka_partition,
+                kafka_offset,
+                kafka_topic
+            from late_arriving_event_staging
+        ON CONFLICT (surrogate_pk)
+        DO NOTHING
+    """
+    try:
+        df.write.jdbc(url=jdbc_url, table="late_arriving_event_staging", mode="overwrite", properties=jdbc_props)
+        execute_sql(sql_text, jdbc_url, jdbc_props)
+    except Exception:
+        raise
+    finally:
+        execute_sql("DROP TABLE IF EXISTS late_arriving_event_staging", jdbc_url, jdbc_props)
 
 
 # Build Spark Session
@@ -166,15 +200,46 @@ flat_df = parsed_df.select(
     "partition"
 )
 
-# Detect late arriving events -> late arriving means that a transaction timestamp is more than 5 minutes before current time
+# Detect late arriving events -> late arriving means that a transaction timestamp is more than 5 minutes before the time it was inserted into the kafka stream
 df_with_lag = flat_df.withColumn(
     "txn_age_sec",
-    unix_timestamp(current_timestamp()) - unix_timestamp(col("transaction_timestamp"))
+    unix_timestamp(col("kafka_timestamp")) - unix_timestamp(col("transaction_timestamp"))
 )
 
-late_arriving_df = df_with_lag.filter(col("txn_age_sec") > 300)
+# Late arriving events are older than 15 minutes
+late_arriving_df = df_with_lag.filter(col("txn_age_sec") > 900)
 
-## OPEN: Need to add logic to log this into db somewhere ##
+# Select and alias columns from late arriving df to prepare for upsert
+late_arriving_df = late_arriving_df \
+    .withColumn(
+        "surrogate_pk",
+        sha2(concat_ws("|", lit("LATE"), col("topic"), col("partition"), col("offset")), 256),
+        ) \
+    .withColumn("run_id", lit(run_id)) \
+    .select(
+        "surrogate_pk",
+        "run_id",
+        "transaction_id",
+        "txn_age_sec",
+        "transaction_timestamp",
+        "event_timestamp",
+        "transaction_amount",
+        "currency",
+        "transaction_type",
+        "status",
+        "fund_id",
+        "fund_name",
+        "deal_id",
+        "deal_name",
+        "kafka_timestamp",
+        col("partition").alias("kafka_partition"),
+        col("offset").alias("kafka_offset"),
+        col("topic").alias("kafka_topic")        
+    )
+
+# Idempotent upsert of late arriving events into log
+upsert_late_arriving_events(late_arriving_df, jdbc_url, jdbc_props)
+
 
 
 # Deduplicate: keep the most recent transaction. Use kafka_timestamp and offset to break ties.
@@ -235,11 +300,9 @@ ledger_df = signed_df.select(
     col("topic").alias("kafka_topic")
 )
 
-ledger_df.show()
-
 
 # Upsert into transaction ledger table
 upsert_transaction_ledger(ledger_df, jdbc_url, jdbc_props)
 
-# Udempotent upsert of transaction ledger into stage table
+# Idempotent upsert of transaction ledger into stage table
 upsert_transaction_balance(jdbc_url, jdbc_props)
