@@ -25,13 +25,12 @@ The system is built around four core components:
 2. **Kafka Stream**
   - Serves as the event log and durable messaging backbone
   - Maintains an ordered, replayable history of all transactions
-3. **Airflow Service**
-  - Orchestrates and schedules batch Spark jobs
-  - Demonstrates dependency management, retries, and monitoring
+3. **Airflow Service** (planned)
+  - Will orchestrate and schedule batch Spark jobs on a fixed interval
+  - Will supply a stable `run_id` per DAG run for retries and cross-table correlation
 4. **Spark Processor**
-  - Consumes transaction event batches
-  - Processes events to update a canonical fund balance table
-  - Maintains state and supports incremental reconciliation
+  - Consumes transaction events from Kafka (full topic read today; offset-based batches planned)
+  - Writes a transaction ledger, audit logs, run metrics, and derived fund/deal balances in PostgreSQL
 
 ## Key Features
 
@@ -44,7 +43,7 @@ The system is built around four core components:
 
 ## Spark Processing Logic
 
-The Spark job processes Kafka transaction events into deterministic, auditable balance deltas for each fund/deal combination.
+The Spark job processes Kafka transaction events into a durable **transaction ledger**, then derives deterministic, auditable balances per fund/deal pair.
 
 1. **Read data from Kafka stream**
   - Consume transaction events from Kafka and retain metadata (`topic`, `partition`, `offset`, `kafka_timestamp`) for traceability and deterministic tie-breaking.
@@ -52,10 +51,11 @@ The Spark job processes Kafka transaction events into deterministic, auditable b
   - Parse JSON payloads into a typed schema.
   - Flatten nested `fund` and `deal` objects into top-level columns.
   - Apply fallback handling for missing fields to support schema evolution.
+  - **Type note:** emitters send `fund_id` and `deal_id` as JSON integers; the Spark schema reads them as **strings** for consistent JDBC/Postgres handling (values coerce cleanly to `VARCHAR` keys in the database).
 3. **Detect late arriving events**
   - Define **late** as **ingest lag**: how long after the business-time `transaction_timestamp` the record appeared in Kafka, using epoch seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`.
   - Flag rows where ingest lag exceeds a fixed threshold (e.g. **900 seconds**); the same message always yields the same lag on replay, unlike comparisons to `current_timestamp()`.
-  - Rows that qualify are written to `**late_arriving_event_log`**; each pipeline run also records how many late rows were observed in that run’s batch in `**run_metrics`** (see [Late arriving events (design)](#late-arriving-events-design)).
+  - Rows that qualify are written to `late_arriving_event_log`; each pipeline run also records how many late rows were observed in that run’s batch in `run_metrics` (see [Late arriving events (design)](#late-arriving-events-design)).
 4. **Identify duplicate events**
   - Treat any repeated `transaction_id` as a duplicate candidate.
   - Resolve duplicates deterministically using descending `transaction_timestamp`, then descending `kafka_timestamp`, then descending `offset`.
@@ -68,16 +68,23 @@ The Spark job processes Kafka transaction events into deterministic, auditable b
   - Persist this summary to a metrics/audit table for debugging and replay analysis.
 7. **Apply business signing logic**
   - Convert transaction types into signed cash flow values:
-    - `DEBIT` -> positive amount
-    - `CREDIT` -> negative amount
-8. **Aggregate by fund and deal**
-  - Group by `fund_id` and `deal_id` to produce per-batch incremental net balance changes.
-9. **Upsert into canonical state table**
-  - Perform an idempotent upsert so retries do not double count and current balances remain correct.
+    - `DEBIT` → negative amount
+    - `CREDIT` → positive amount
+8. **Upsert into the transaction ledger**
+  - After deduplication, write one row per winning transaction to `transaction_ledger` with signed amount and Kafka lineage.
+  - Use `ON CONFLICT (transaction_id) DO NOTHING`: each `transaction_id` is stored at most once. Replaying the **same** input does not add a second ledger row.
+9. **Derive canonical balances from the ledger**
+  - Recompute `transaction_balance` as `SUM(transaction_amount)` grouped by `(fund_id, deal_id)` over the **entire** ledger (not a batch-only incremental add in SQL).
+  - Upsert into `transaction_balance` with `ON CONFLICT DO UPDATE`, setting `balance` to the new aggregate. If the ledger is unchanged (same inputs replayed), the sums are unchanged and balances stay the same (**idempotent**). If new transactions were added to the ledger since the last run, affected fund/deal balances update to reflect the new totals.
+10. **Aggregate and persist run metrics**
+  - Build one row per `run_id` with `record_count` (rows in the batch), `duplicate_count` (duplicate groups observed in the batch), and `late_arrival_count` (rows matching the ingest-lag rule in the batch).
+  - Upsert into `run_metrics` on `run_id` with `ON CONFLICT DO UPDATE`, so a **retry/replay of the same run** replaces metrics with the latest computed values for that run.
 
 ## Late arriving events (design)
 
-This section records the product and replay semantics for **late** detection and logging. It matches incremental, offset-based batches (each run processes only new Kafka data since the last successful commit).
+This section records the product and replay semantics for **late** detection and logging.
+
+**Current scope:** the Spark job reads the **full** Kafka topic on each run (core transformation and sink logic are the focus). **Planned:** offset-based batches so each run processes only new messages since the last successful commit.
 
 ### Definition of “late”
 
@@ -85,19 +92,19 @@ A record is treated as **late for observability** when **ingest lag** exceeds a 
 
 - **Ingest lag (seconds)** = `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`
 - `**kafka_timestamp`** is the timestamp from the Spark Kafka source for that message (broker metadata).
-- `**transaction_timestamp`** is the business event time from the payload.
+- `**transaction_timestamp**` is the business event time from the payload.
 
 This definition is **stable across replays**: reprocessing the same message recomputes the **same** lag, so a batch replay does not reinterpret “late” using wall-clock time at replay.
 
 ### Surrogate primary key and idempotent log writes
 
-Each row in `**late_arriving_event_log`** is keyed by a **deterministic `surrogate_pk`**: a SHA-256 hex string over a fixed UTF-8 literal that includes the **physical Kafka identity** — `**topic`**, `**partition`**, and `**offset**` — in a single documented order (e.g. `LATE|{topic}|{partition}|{offset}` with `|` separators). That identity is stable for the life of the message in the log.
+Each row in `late_arriving_event_log` is keyed by a **deterministic `surrogate_pk`**: a SHA-256 hex string over a fixed UTF-8 literal that includes the **physical Kafka identity** — `topic`, `partition`, and `offset` — in a single documented order (e.g. `LATE|{topic}|{partition}|{offset}` with `|` separators). That identity is stable for the life of the message in the log.
 
-Inserts use `**ON CONFLICT (surrogate_pk) DO NOTHING**`: the **first** successful write wins; replays and retries do **not** replace or duplicate the observability row. That preserves “what we thought when we first persisted this late message.”
+Inserts use `**ON CONFLICT (surrogate_pk) DO NOTHING`**: the **first** successful write wins; replays and retries do **not** replace or duplicate the observability row. That preserves “what we thought when we first persisted this late message.”
 
 ### Run metrics vs log cardinality
 
-`**run_metrics.late_arrival_count`** (or an equivalently named column) is the count of messages **in the current batch slice** that satisfy the late predicate **in Spark**, computed every time the job runs — including replays of the same offset range. That number answers: *“this execution observed n late messages in its input.”* It is **not** required to equal the number of **new** rows appended to `**late_arriving_event_log`** on that attempt (replays often append **zero** new rows because of `DO NOTHING`). Document both meanings in dashboards if you expose both.
+`**run_metrics.late_arrival_count`** is the count of messages **in the current batch slice** that satisfy the late predicate **in Spark**, computed every time the job runs. That number answers: *“this execution observed n late messages in its input.”* It is **not** required to equal the number of **new** rows appended to `late_arriving_event_log` on that attempt (replays often append **zero** new rows because of `DO NOTHING`).
 
 ### Why not `current_timestamp()` − `transaction_timestamp`?
 
@@ -105,50 +112,68 @@ Comparing business time to **job wall clock** changes every time you run or repl
 
 ## PostgreSQL schema
 
-PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, and **drill-down logs**. Pipeline runs should carry a stable `**run_id`** (typically one Airflow/Spark invocation) for correlation across tables.
+PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, and **drill-down logs**. Each run is tagged with a `**run_id`** for correlation across tables (see [Airflow orchestration (planned)](#airflow-orchestration-planned)).
 
 ### Tables and grain
 
 
 | Table                     | Grain / identity                                                         | Purpose                                                                                                                       |
 | ------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| `transaction_balance`     | `(fund_id, deal_id)`                                                     | Current net balance per fund/deal pair.                                                                                       |
-| `run_metrics`             | `run_id`                                                                 | One row per pipeline run: volumes and quality counts.                                                                         |
+| `transaction_ledger`      | `transaction_id` (+ unique Kafka coordinates)                            | Append-style ledger of signed movements; idempotent per `transaction_id` on replay.                                           |
+| `transaction_balance`     | `(fund_id, deal_id)`                                                     | Current net balance per fund/deal pair, derived as `SUM` over the ledger.                                                     |
+| `run_metrics`             | `run_id`                                                                 | One row per pipeline run: volumes and quality counts; updated on retry of the same `run_id`.                                  |
 | `duplicate_records_log`   | **Surrogate PK** + unique `(run_id, transaction_id)`                     | Duplicate groups for that run: counts, min/max business time, and full Kafka pointer for the retained winner.                 |
 | `late_arriving_event_log` | **Surrogate PK** + unique `(kafka_topic, kafka_partition, kafka_offset)` | One durable row per **physical Kafka message** flagged late; survives retries, backfills, and replays without double inserts. |
 
 
 ### Idempotent surrogate keys (SHA-256, 64-char lowercase hex)
 
-Both log tables use a `**surrogate_pk`** primary key computed in Spark as `**sha256(..., 256)`** (hex) over a UTF-8 string with fixed prefixes so key spaces never collide:
+Both log tables use a `**surrogate_pk`** primary key computed in Spark as `**sha256(..., 256)**` (hex) over a UTF-8 string with fixed prefixes so key spaces never collide:
 
-- `**duplicate_records_log.surrogate_pk**`: hash the UTF-8 literal string `DUP|{run_id}|{transaction_id}` (exact `|` separators; keep `run_id` / `transaction_id` consistent with what you write to the row). Same `**run_id**` + same `**transaction_id**` always maps to one row, so retries of the **same** run are idempotent.
-- `**late_arriving_event_log.surrogate_pk`**: hash the UTF-8 literal string `LATE|{kafka_topic}|{partition}|{offset}`, with `**partition`** and `**offset**` as decimal integers (no zero-padding). Identity is the Kafka coordinate, not `**transaction_id**`, so replaying the same message always hits the same key even if `**transaction_id**` appears across multiple runs.
+- `**duplicate_records_log.surrogate_pk**`: hash the UTF-8 literal string `DUP|{run_id}|{transaction_id}` (exact `|` separators). Same `run_id` + same `transaction_id` always maps to one row, so retries of the **same** run are idempotent.
+- `**late_arriving_event_log.surrogate_pk`**: hash the UTF-8 literal string `LATE|{kafka_topic}|{partition}|{offset}`, with `partition` and `offset` as decimal integers (no zero-padding). Identity is the Kafka coordinate, not `transaction_id`.
 
 **Database constraints:** DDL adds **unique indexes** on the natural tuples above as well (`duplicate_records_identity_uq`, `late_arriving_event_kafka_uq`) so ingestion bugs cannot silently diverge surrogate vs physical identity.
 
-`**transaction_balance`**
+`**transaction_ledger`**
+
+- One row per `transaction_id` from the deduplicated (winning) stream, with signed `transaction_amount`, fund/deal keys, and Kafka metadata.
+- `ON CONFLICT (transaction_id) DO NOTHING` on insert: replays with the same winning rows do not create duplicate ledger entries.
+
+`**transaction_balance**`
 
 - `fund_id`, `deal_id` — natural key (identifiers only; names live on events / dimensions, not on state).
-- `balance` — current net balance after applied signed movements.
-- `last_modified` — when this row was last updated by the job.
+- `balance` — `SUM(transaction_amount)` from `transaction_ledger` for that fund/deal (full snapshot recompute each run).
+- **Idempotency:** identical ledger contents produce identical sums; `ON CONFLICT DO UPDATE` refreshes balances only when the recomputed total changes (e.g. new `transaction_id`s landed in the ledger).
 
 `**run_metrics`**
 
 - `record_count` — rows considered in the run after parsing (aligned with Spark’s batch scope).
-- `duplicate_count` — number of distinct `**transaction_id**` values that had duplicates in that run; should match `SELECT COUNT(*) FROM duplicate_records_log WHERE run_id = ?` after a successful load.
-- `late_arrival_count` — number of messages in **this run’s batch** that satisfied the ingest-lag late rule in Spark (**observed in batch**), recorded on every execution including replays. It does **not** necessarily equal the number of **new** rows inserted into `late_arriving_event_log` on that attempt (replay with `ON CONFLICT DO NOTHING` on `surrogate_pk` typically inserts zero duplicate log rows).
-- `run_timestamp` — when the run was recorded (e.g. job start or completion).
+- `duplicate_count` — number of distinct `transaction_id` values that had duplicates in that run (batch observation); on first load for a `run_id`, should match `SELECT COUNT(*) FROM duplicate_records_log WHERE run_id = ?`.
+- `late_arrival_count` — number of messages in **this run’s batch** that satisfied the ingest-lag late rule in Spark (**observed in batch**). It does **not** necessarily equal new rows inserted into `late_arriving_event_log` on replay (`ON CONFLICT DO NOTHING` on `surrogate_pk`).
+- `run_timestamp` — when the run was recorded (updated on `ON CONFLICT DO UPDATE` when the same `run_id` is retried).
 
 `**duplicate_records_log`**
 
-Winner metadata includes `**winner_partition`** and `**winner_offset**` (with `**winner_topic**`) so the chosen message can be relocated in Kafka independently of other ties.
+Winner metadata includes `**winner_partition**` and `**winner_offset**` (with `**winner_topic**`) so the chosen message can be relocated in Kafka independently of other ties.
 
 `**late_arriving_event_log**`
 
-- `**txn_age_sec**` (or the column name in DDL) — persisted **ingest lag** in seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`, matching the Spark late rule. See [Late arriving events (design)](#late-arriving-events-design).
+- `**txn_age_sec**` — persisted **ingest lag** in seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`, matching the Spark late rule. See [Late arriving events (design)](#late-arriving-events-design).
 
 DDL for these objects lives in `**db/init.sql`**.
+
+## Airflow orchestration (planned)
+
+Airflow is not required to run the pipeline today; the Spark job can be executed manually while the core logic matures.
+
+**Planned integration:**
+
+- A DAG under `airflow/dags/` will schedule the Spark batch job (e.g. every 5 minutes).
+- `**run_id`** will be passed from Airflow (e.g. `dag_run.run_id` or a templated execution id) into the Spark job so retries of the **same** DAG run reuse one `run_id` across `run_metrics`, `duplicate_records_log`, and correlated audit rows.
+- **Today:** `spark/job.py` generates a local UUID `run_id` at startup for development and testing.
+- Task dependencies will enforce ordering: infrastructure health → Spark processing → optional validation queries against PostgreSQL.
+- Offset checkpoints for Kafka will align with successful DAG completion (see [Late arriving events (design)](#late-arriving-events-design)).
 
 ## Event Schema
 
@@ -174,6 +199,7 @@ The event schema represents a financial transaction event in an investment fund 
 {
   "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
   "transaction_timestamp": "2026-05-02T14:30:00.000Z",
+  "event_timestamp": "2026-05-02T14:30:05.123Z",
   "transaction_amount": 125000.5,
   "currency": "USD",
   "transaction_type": "CREDIT",
@@ -196,17 +222,18 @@ The event schema represents a financial transaction event in an investment fund 
 ### Field Definitions
 
 
-| Field                   | Type              | Description                                             | Required |
-| ----------------------- | ----------------- | ------------------------------------------------------- | -------- |
-| `transaction_id`        | string (UUID)     | Unique identifier for the transaction                   | Yes      |
-| `transaction_timestamp` | string (ISO 8601) | When the transaction occurred (used for event ordering) | Yes      |
-| `transaction_amount`    | number (float)    | Transaction amount in specified currency                | Yes      |
-| `currency`              | string            | Currency code (e.g., USD, EUR)                          | Yes      |
-| `transaction_type`      | string            | Direction of cash flow: `DEBIT`, `CREDIT`, `REVERSAL`   | Yes      |
-| `status`                | string            | Processing status: `PENDING`, `COMPLETED`, `FAILED`     | Yes      |
-| `fund`                  | object            | Fund context: `fund_id` (int), `fund_name` (string)     | Yes      |
-| `deal`                  | object            | Deal context: `deal_id` (int), `deal_name` (string)     | Yes      |
-| `metadata`              | object            | Optional enrichment data (e.g., source, strategy)       | No       |
+| Field                   | Type              | Description                                                                              | Required |
+| ----------------------- | ----------------- | ---------------------------------------------------------------------------------------- | -------- |
+| `transaction_id`        | string (UUID)     | Unique identifier for the transaction                                                    | Yes      |
+| `transaction_timestamp` | string (ISO 8601) | When the transaction occurred (used for event ordering)                                  | Yes      |
+| `event_timestamp`       | string (ISO 8601) | When the event was produced / ingested (emitter wall clock)                              | Yes      |
+| `transaction_amount`    | number (float)    | Transaction amount in specified currency                                                 | Yes      |
+| `currency`              | string            | Currency code (e.g., USD, EUR)                                                           | Yes      |
+| `transaction_type`      | string            | Direction of cash flow: `DEBIT`, `CREDIT`, `REVERSAL`                                    | Yes      |
+| `status`                | string            | Processing status: `PENDING`, `COMPLETED`, `FAILED`                                      | Yes      |
+| `fund`                  | object            | Fund context: `fund_id` (integer in JSON; read as string in Spark), `fund_name` (string) | Yes      |
+| `deal`                  | object            | Deal context: `deal_id` (integer in JSON; read as string in Spark), `deal_name` (string) | Yes      |
+| `metadata`              | object            | Optional enrichment data (e.g., source, strategy)                                        | No       |
 
 
 ### Schema Evolution
@@ -215,14 +242,17 @@ New fields are added as optional to maintain backward compatibility. Consumers a
 
 **Spark Processing Strategy**: When reading events in PySpark, missing fields are handled with default values using functions like `coalesce()` or `.get()` with fallbacks. For example, a new `risk_factor` field defaults to 0.0 if absent.
 
-**State Table Design**: `transaction_balance` stores only `**fund_id`**, `**deal_id`**, `**balance**`, and `**last_modified**` so the ledger state stays narrow and authoritative; enrichment (names, metadata) stays on raw events or drill-down logs.
+**State Table Design**: `transaction_balance` stores only `fund_id`, `deal_id`, `balance`, and `last_modified` so the ledger state stays narrow and authoritative; enrichment (names, metadata) stays on raw events or drill-down logs.
+
+**Identifier types**: JSON events use integer `fund_id` / `deal_id`; Spark declares them as strings in the parse schema and persists them as `VARCHAR` in PostgreSQL for consistent keys across sinks.
 
 ## Project Structure
 
 ```
 streaming-fund-balance-engine/
 ├── emitter/
-│   └── emitter.py              # Event producer for transaction events
+│   ├── emitter.py              # Event producer for transaction events
+│   └── insert_duplicate.py     # Publishes the same transaction twice (duplicate testing)
 ├── spark/
 │   └── job.py                  # Spark batch processing job for balance computation
 ├── airflow/
@@ -265,10 +295,9 @@ Download these JARs into `./jars` before running Docker Compose:
 
 ### Connecting Spark to PostgreSQL
 
-`docker-compose.yml` starts PostgreSQL with database `**fund_balance`**, user `**funduser`**, password `**fundpass**`, and applies `**db/init.sql**` on first data volume creation.
+`docker-compose.yml` starts PostgreSQL with database `**fund_balance`**, user `**funduser**`, password `**fundpass**`, and applies `**db/init.sql**` on first data volume creation.
 
-- **Spark runs inside the Compose network** (e.g. `spark-submit` from `spark-master`): use host `**postgres`**, port `**5432`**:
-`jdbc:postgresql://postgres:5432/fund_balance`
+- **Spark runs inside the Compose network** (e.g. `spark-submit` from `spark-master`): use host `**postgres`**, port `**5432**`: `jdbc:postgresql://postgres:5432/fund_balance`
 - **Spark runs on your host machine** (IDE / local `spark-submit`): use `**localhost:5432`** (same URL path and credentials).
 
 Put the PostgreSQL JAR in `./jars` (already on Spark’s extra classpath via Compose). In PySpark, use `format("jdbc")` with `.option("url", url)`, `.option("dbtable", table)`, `.option("user", "funduser")`, `.option("password", "fundpass")`, and for upserts use `foreachBatch` with JDBC or stage via temp table + SQL `ON CONFLICT` (implementation detail for a later change).
@@ -276,10 +305,20 @@ Put the PostgreSQL JAR in `./jars` (already on Spark’s extra classpath via Com
 ## Usage
 
 1. From the repo root: `docker compose -f docker/docker-compose.yml up -d` (starts Kafka, PostgreSQL, Spark master/worker, and related services)
-2. Run the event emitter to publish transaction messages
-3. Start Airflow and enable the DAG for batch processing
-4. Execute the Spark job to process events and update balances
-5. Review the canonical balance table to verify correctness
+2. Run the event emitter to publish transaction messages (`python emitter/emitter.py`)
+3. Execute the Spark job to process events (ledger, balances, audit logs, and `run_metrics`) — Airflow scheduling is [planned](#airflow-orchestration-planned)
+4. (Future) Enable the Airflow DAG for scheduled runs with a stable `run_id`
+5. Review `transaction_balance`, `run_metrics`, and drill-down logs to verify correctness
+
+### Testing duplicate detection
+
+With Kafka running, publish two messages that share the same `transaction_id` (different Kafka offsets):
+
+```bash
+python emitter/insert_duplicate.py
+```
+
+Then run the Spark job and inspect `duplicate_records_log` (and `run_metrics.duplicate_count`) to confirm deduplication and per-run duplicate summary logging.
 
 ## Why This Project Matters
 

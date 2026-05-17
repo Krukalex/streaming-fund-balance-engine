@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, row_number, desc, when, sum, count, max, min, coalesce, unix_timestamp, lit, to_timestamp, current_timestamp, sha2, concat_ws
+from pyspark.sql.functions import from_json, col, row_number, desc, when, sum as spark_sum, count, max, min, coalesce, unix_timestamp, lit, to_timestamp, current_timestamp, sha2, concat_ws
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, TimestampType, MapType
 from pyspark.sql.window import Window
 from datetime import datetime
@@ -121,6 +121,62 @@ def upsert_late_arriving_events(df, jdbc_url, jdbc_props):
         execute_sql("DROP TABLE IF EXISTS late_arriving_event_staging", jdbc_url, jdbc_props)
 
 
+# Upsert duplicate event log into postgres
+def upsert_duplicate_events(df, jdbc_url, jdbc_props):
+    sql_text = """
+        INSERT INTO
+            duplicate_records_log (surrogate_pk, run_id, transaction_id, duplicate_count, earliest_transaction_timestamp, latest_transaction_timestamp, winner_transaction_timestamp, winner_kafka_timestamp, winner_partition, winner_offset, winner_topic)
+            select
+                surrogate_pk, 
+                run_id, 
+                transaction_id, 
+                duplicate_count, 
+                earliest_transaction_timestamp, 
+                latest_transaction_timestamp, 
+                winner_transaction_timestamp, 
+                winner_kafka_timestamp, 
+                winner_partition, 
+                winner_offset, 
+                winner_topic
+            from duplicate_records_staging
+        ON CONFLICT (surrogate_pk)
+        DO NOTHING
+    """
+    try:
+        df.write.jdbc(url=jdbc_url, table="duplicate_records_staging", mode="overwrite", properties=jdbc_props)
+        execute_sql(sql_text, jdbc_url, jdbc_props)
+    except Exception:
+        raise
+    finally:
+        execute_sql("DROP TABLE IF EXISTS duplicate_records_staging", jdbc_url, jdbc_props)
+
+# Upsert run metrics into postgres
+def upsert_run_metrics(df, jdbc_url, jdbc_props):
+    sql_text = """
+        INSERT INTO
+            run_metrics (run_id, record_count, duplicate_count, late_arrival_count, run_timestamp)
+            select
+                run_id,
+                record_count,
+                duplicate_count,
+                late_arrival_count,
+                run_timestamp
+            from run_metrics_staging
+        ON CONFLICT (run_id)
+        DO UPDATE SET
+            record_count = EXCLUDED.record_count,
+            duplicate_count = EXCLUDED.duplicate_count,
+            late_arrival_count = EXCLUDED.late_arrival_count,
+            run_timestamp = EXCLUDED.run_timestamp
+    """
+    try:
+        df.write.jdbc(url=jdbc_url, table="run_metrics_staging", mode="overwrite", properties=jdbc_props)
+        execute_sql(sql_text, jdbc_url, jdbc_props)
+    except Exception:
+        raise
+    finally:
+        execute_sql("DROP TABLE IF EXISTS run_metrics_staging", jdbc_url, jdbc_props)
+
 # Build Spark Session
 spark = SparkSession.builder \
     .appName("KafkaStreaming") \
@@ -200,7 +256,7 @@ flat_df = parsed_df.select(
     "partition"
 )
 
-# Detect late arriving events -> late arriving means that a transaction timestamp is more than 5 minutes before the time it was inserted into the kafka stream
+# Detect late arriving events -> late arriving means that a transaction timestamp is more than 15 minutes before the time it was inserted into the kafka stream
 df_with_lag = flat_df.withColumn(
     "txn_age_sec",
     unix_timestamp(col("kafka_timestamp")) - unix_timestamp(col("transaction_timestamp"))
@@ -241,7 +297,6 @@ late_arriving_df = late_arriving_df \
 upsert_late_arriving_events(late_arriving_df, jdbc_url, jdbc_props)
 
 
-
 # Deduplicate: keep the most recent transaction. Use kafka_timestamp and offset to break ties.
 winner_window = Window.partitionBy("transaction_id").orderBy(
     desc("transaction_timestamp"),
@@ -277,7 +332,29 @@ duplicate_summary = (
     .filter(col("duplicate_count") > 1)
 )
 
-## OPEN: Need to add logic to log this into db somewhere ##
+# Select and alias columns from duplicate summary df to prepare for upsert
+duplicate_summary = duplicate_summary \
+    .withColumn(
+        "surrogate_pk",
+        sha2(concat_ws("|", lit("DUP"), lit(run_id), col("transaction_id")), 256),
+        ) \
+    .withColumn("run_id", lit(run_id)) \
+    .select(
+        "surrogate_pk",
+        "run_id",
+        "transaction_id",
+        "duplicate_count",
+        col("earliest_timestamp").alias("earliest_transaction_timestamp"),
+        col("latest_timestamp").alias("latest_transaction_timestamp"),
+        "winner_transaction_timestamp",
+        "winner_kafka_timestamp",
+        "winner_partition",
+        "winner_offset",
+        "winner_topic",      
+    )
+
+# Idempotent upsert of dupulicate events into log
+upsert_duplicate_events(duplicate_summary, jdbc_url, jdbc_props)
 
 # Calculate signed amounts based on transaction type
 signed_df = deduped_df.withColumn(
@@ -306,3 +383,24 @@ upsert_transaction_ledger(ledger_df, jdbc_url, jdbc_props)
 
 # Idempotent upsert of transaction ledger into stage table
 upsert_transaction_balance(jdbc_url, jdbc_props)
+
+# Derive run metrics
+run_metrics_df = (
+            df_with_lag.agg(
+                count(lit(1)).alias("record_count"),
+                spark_sum(when(col("txn_age_sec") > 900, 1).otherwise(0)).alias("late_arrival_count")
+            )
+        ) \
+    .withColumn("run_id", lit(run_id)) \
+    .withColumn("duplicate_count", lit(duplicate_summary.count())) \
+    .withColumn("run_timestamp", current_timestamp())  \
+    .select(
+        "run_id",
+        "record_count",
+        "duplicate_count",
+        "late_arrival_count",
+        "run_timestamp"
+    )
+
+# Idempotent upsert into run metrics table
+upsert_run_metrics(run_metrics_df, jdbc_url, jdbc_props)
