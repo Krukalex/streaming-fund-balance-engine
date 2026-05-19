@@ -73,5 +73,14 @@ CREATE TABLE IF NOT EXISTS late_arriving_event_log (
     CONSTRAINT late_arriving_event_kafka_uq UNIQUE (kafka_topic, kafka_partition, kafka_offset)
 );
 
+CREATE TABLE IF NOT EXISTS kafka_offsets (
+    run_id VARCHAR(128) PRIMARY KEY NOT NULL,
+    topic VARCHAR(128) NOT NULL,
+    partition INTEGER NOT NULL,
+    start_offset INTEGER,
+    end_offset INTEGER,
+    run_timestamp TIMESTAMPTZ
+);
+
 CREATE INDEX IF NOT EXISTS idx_duplicate_records_log_run_id ON duplicate_records_log (run_id);
 CREATE INDEX IF NOT EXISTS idx_late_arriving_event_log_run_id ON late_arriving_event_log (run_id);

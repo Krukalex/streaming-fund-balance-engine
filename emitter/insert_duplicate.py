@@ -23,7 +23,11 @@ funds = [
 ]
 
 transaction_types = ['DEBIT', 'CREDIT']
-statuses = ['PENDING', 'COMPLETED', 'FAILED']
+statuses = [
+    # 'PENDING', 
+    'COMPLETED', 
+    'FAILED'
+    ]
 
 
 def generate_transaction() -> dict:
