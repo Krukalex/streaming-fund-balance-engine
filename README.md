@@ -93,15 +93,17 @@ Spark uses the **batch** Kafka source (`spark.read.format("kafka")`), not Struct
 
 PostgreSQL table `kafka_offsets` records **per-run consumption metadata** and acts as the read pointer for the next batch:
 
-| Column | Description |
-| ------ | ----------- |
-| `run_id` | Correlates with the pipeline run (same identifier family as `run_metrics`; today generated in `spark/job.py`, later from Airflow) |
-| `topic` | Kafka topic name (e.g. `transactions`) |
-| `partition` | Topic partition id |
-| `start_offset` | First offset read in this run (inclusive; matches Spark `startingOffsets`) |
-| `end_offset` | **Next** offset to read after this run (exclusive end; becomes the next run’s `startingOffsets`) |
-| `status` | Run outcome (e.g. `SUCCESS`); only successful runs advance the read pointer |
-| `run_timestamp` | When the checkpoint row was recorded |
+
+| Column          | Description                                                                                                                       |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `run_id`        | Correlates with the pipeline run (same identifier family as `run_metrics`; today generated in `spark/job.py`, later from Airflow) |
+| `topic`         | Kafka topic name (e.g. `transactions`)                                                                                            |
+| `partition`     | Topic partition id                                                                                                                |
+| `start_offset`  | First offset read in this run (inclusive; matches Spark `startingOffsets`)                                                        |
+| `end_offset`    | **Next** offset to read after this run (exclusive end; becomes the next run’s `startingOffsets`)                                  |
+| `status`        | Run outcome (e.g. `SUCCESS`); only successful runs advance the read pointer                                                       |
+| `run_timestamp` | When the checkpoint row was recorded                                                                                              |
+
 
 DDL is in `db/init.sql`.
 
@@ -178,7 +180,7 @@ PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, an
 | `run_metrics`             | `run_id`                                                                 | One row per pipeline run: volumes and quality counts; updated on retry of the same `run_id`.                                  |
 | `duplicate_records_log`   | **Surrogate PK** + unique `(run_id, transaction_id)`                     | Duplicate groups for that run: counts, min/max business time, and full Kafka pointer for the retained winner.                 |
 | `late_arriving_event_log` | **Surrogate PK** + unique `(kafka_topic, kafka_partition, kafka_offset)` | One durable row per **physical Kafka message** flagged late; survives retries, backfills, and replays without double inserts. |
-| `kafka_offsets`             | `run_id`                                                                 | Per-run Kafka consumption checkpoint: topic, partition, offset range, and status for offset-based batch resume. |
+| `kafka_offsets`           | `run_id`                                                                 | Per-run Kafka consumption checkpoint: topic, partition, offset range, and status for offset-based batch resume.               |
 
 
 ### Idempotent surrogate keys (SHA-256, 64-char lowercase hex)
@@ -217,11 +219,11 @@ Both log tables use a `**surrogate_pk`** primary key computed in Spark as `**sha
 
 `**duplicate_records_log`**
 
-Winner metadata includes `**winner_partition`** and `**winner_offset`** (with `**winner_topic**`) so the chosen message can be relocated in Kafka independently of other ties.
+Winner metadata includes `**winner_partition`** and `**winner_offset`** (with `**winner_topic`**) so the chosen message can be relocated in Kafka independently of other ties.
 
-`**late_arriving_event_log**`
+`**late_arriving_event_log`**
 
-- `**txn_age_sec**` — persisted **ingest lag** in seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`, matching the Spark late rule. See [Late arriving events (design)](#late-arriving-events-design).
+- `**txn_age_sec`** — persisted **ingest lag** in seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`, matching the Spark late rule. See [Late arriving events (design)](#late-arriving-events-design).
 
 DDL for these objects lives in `**db/init.sql`**.
 
