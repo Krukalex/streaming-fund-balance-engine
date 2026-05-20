@@ -32,6 +32,8 @@ def get_starting_offsets_json(spark, jdbc_url, jdbc_props, topic: str) -> str:
             COALESCE(MAX(end_offset), -2) as last_processed_offset
         FROM 
             kafka_offsets
+        WHERE
+            status = 'SUCCESS'
         GROUP BY
             topic,
             partition

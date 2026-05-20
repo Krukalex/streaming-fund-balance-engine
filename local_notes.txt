@@ -1,3 +1,16 @@
 run spark job in docker:
 
 docker exec -it spark-master /opt/spark/bin/spark-submit --master spark://spark-master:7077 --jars /opt/spark/jars-extra/* /opt/spark-apps/job.py
+
+query postgres:
+
+docker exec -it postgres-fund-balance psql -U funduser -d fund_balance -c "SELECT * FROM transaction_balance;"
+
+
+Transaction: 8f1f1b7b-b4a0-49b3-8417-1a6c30ff1e4e
+Fund: Fund C, Deal: Deal D
+Amount: 210738.01, Status: PENDING
+---
+Transaction: 8f1f1b7b-b4a0-49b3-8417-1a6c30ff1e4e
+Fund: Fund C, Deal: Deal D
+Amount: 210738.01, Status: PENDING

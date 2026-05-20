@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS kafka_offsets (
     run_id VARCHAR(128) PRIMARY KEY NOT NULL,
     topic VARCHAR(128) NOT NULL,
     partition INTEGER NOT NULL,
+    status VARCHAR(128),
     start_offset INTEGER,
     end_offset INTEGER,
     run_timestamp TIMESTAMPTZ
