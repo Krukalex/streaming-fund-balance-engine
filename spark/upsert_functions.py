@@ -1,3 +1,6 @@
+from query_wrappers import execute_sql
+
+
 # Upsert transaction balance into postgres
 def upsert_transaction_ledger(df, jdbc_url, jdbc_props):
     sql_text = """
@@ -141,3 +144,31 @@ def upsert_run_metrics(df, jdbc_url, jdbc_props):
         raise
     finally:
         execute_sql("DROP TABLE IF EXISTS run_metrics_staging", jdbc_url, jdbc_props)
+
+
+def upsert_kafka_offsets(df, jdbc_url, jdbc_props):
+    sql_text = """
+        INSERT INTO kafka_offsets (
+            run_id, topic, partition, status, start_offset, end_offset, run_timestamp
+        )
+        SELECT
+            run_id, topic, partition, status, start_offset, end_offset, run_timestamp
+        FROM kafka_offsets_staging
+        ON CONFLICT (run_id) DO UPDATE SET
+            topic = EXCLUDED.topic,
+            partition = EXCLUDED.partition,
+            status = EXCLUDED.status,
+            start_offset = EXCLUDED.start_offset,
+            end_offset = EXCLUDED.end_offset,
+            run_timestamp = EXCLUDED.run_timestamp
+    """
+    try:
+        df.write.jdbc(
+            url=jdbc_url,
+            table="kafka_offsets_staging",
+            mode="overwrite",
+            properties=jdbc_props,
+        )
+        execute_sql(sql_text, jdbc_url, jdbc_props)
+    finally:
+        execute_sql("DROP TABLE IF EXISTS kafka_offsets_staging", jdbc_url, jdbc_props)

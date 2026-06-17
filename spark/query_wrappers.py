@@ -1,3 +1,5 @@
+from pyspark import SparkContext
+
 # Reusable function to execute sql statement
 def execute_sql(sql_text, jdbc_url, jdbc_props):
     gateway = SparkContext._gateway
