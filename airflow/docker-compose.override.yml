@@ -1,0 +1,32 @@
+# Join Astro Airflow to the data-plane network and expose the Docker socket so
+# DAG tasks can docker exec into spark-master-fund-balance.
+services:
+  api-server:
+    networks:
+      - airflow
+      - fund-pipeline
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  scheduler:
+    networks:
+      - airflow
+      - fund-pipeline
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  dag-processor:
+    networks:
+      - airflow
+      - fund-pipeline
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+  triggerer:
+    networks:
+      - airflow
+      - fund-pipeline
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+networks:
+  fund-pipeline:
+    external: true
+    name: fund-pipeline

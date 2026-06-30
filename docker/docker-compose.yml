@@ -1,5 +1,11 @@
+networks:
+  fund-pipeline:
+    name: fund-pipeline
+
 services:
   zookeeper:
+    networks:
+      - fund-pipeline
     image: confluentinc/cp-zookeeper:7.4.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
@@ -8,6 +14,8 @@ services:
 
   kafka:
     image: confluentinc/cp-kafka:7.4.0
+    networks:
+      - fund-pipeline
     depends_on:
       - zookeeper
     ports:
@@ -23,12 +31,14 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: postgres-fund-balance
+    networks:
+      - fund-pipeline
     environment:
       POSTGRES_USER: funduser
       POSTGRES_PASSWORD: fundpass
       POSTGRES_DB: fund_balance
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -38,37 +48,41 @@ services:
       timeout: 5s
       retries: 5
 
-  spark-master:
+  spark-master-fund-balance:
     image: apache/spark:3.5.1
-    container_name: spark-master
+    container_name: spark-master-fund-balance
+    networks:
+      - fund-pipeline
     environment:
       - SPARK_MODE=master
       - SPARK_DRIVER_EXTRA_CLASSPATH=/opt/spark/jars-extra/*
       - SPARK_EXECUTOR_EXTRA_CLASSPATH=/opt/spark/jars-extra/*
     ports:
       - "7077:7077"
-      - "8080:8080"
+      - "8081:8080"
     volumes:
       - ../spark:/opt/spark-apps
       - ../jars:/opt/spark/jars-extra
     command: >
-      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master-fund-balance --port 7077 --webui-port 8080
 
-  spark-worker:
+  spark-worker-fund-balance:
     image: apache/spark:3.5.1
-    container_name: spark-worker
+    container_name: spark-worker-fund-balance
+    networks:
+      - fund-pipeline
     depends_on:
-      - spark-master
+      - spark-master-fund-balance
     environment:
       - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_MASTER_URL=spark://spark-master-fund-balance:7077
       - SPARK_DRIVER_EXTRA_CLASSPATH=/opt/spark/jars-extra/*
       - SPARK_EXECUTOR_EXTRA_CLASSPATH=/opt/spark/jars-extra/*
     volumes:
       - ../spark:/opt/spark-apps
       - ../jars:/opt/spark/jars-extra
     command: >
-      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master-fund-balance:7077
 
 volumes:
   postgres_data:

@@ -6,11 +6,12 @@ from datetime import datetime
 from pyspark import SparkContext
 from uuid import uuid4
 import json
+import os
 from query_wrappers import execute_sql, read_postgres_query
 from upsert_functions import upsert_transaction_ledger, upsert_transaction_balance, upsert_late_arriving_events, upsert_duplicate_events, upsert_run_metrics, upsert_kafka_offsets
 
 
-run_id = str(uuid4()).replace("-", "_")
+run_id = os.environ.get("RUN_ID") or str(uuid4()).replace("-", "_")
 print(f"RUN ID: {run_id}")
 
 # Define JDBC connection details for postgres
@@ -24,6 +25,8 @@ jdbc_props = {
 KAFKA_TOPIC = "transactions"
 
 # Function to get the starting offset for the current batch based on postgres log for last visited offset
+
+
 def get_starting_offsets_json(spark, jdbc_url, jdbc_props, topic: str) -> str:
     sql_query = """
         SELECT
@@ -39,7 +42,8 @@ def get_starting_offsets_json(spark, jdbc_url, jdbc_props, topic: str) -> str:
             partition
     """
 
-    rows = read_postgres_query(spark, sql_query, jdbc_url, jdbc_props).collect()
+    rows = read_postgres_query(
+        spark, sql_query, jdbc_url, jdbc_props).collect()
     if not rows:
         # First run: from the beginning (partition 0 only; extend if you add partitions)
         return json.dumps({topic: {"0": 0}})
@@ -57,7 +61,10 @@ def get_starting_offsets_json(spark, jdbc_url, jdbc_props, topic: str) -> str:
 # Build Spark Session
 spark = SparkSession.builder \
     .appName("KafkaStreaming") \
+    .config("spark.ui.showConsoleProgress", "false")\
     .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")  # or "ERROR"
 
 # Define schema of transaction event to be read from Kafka stream
 schema = StructType([
@@ -79,17 +86,41 @@ schema = StructType([
     StructField("metadata", MapType(StringType(), StringType()), True),
 ])
 
-# Find the last read offset
-starting_offsets = get_starting_offsets_json(spark, jdbc_url, jdbc_props, KAFKA_TOPIC)
-print(f"startingOffsets: {starting_offsets}")
+# Determine run mode
+run_mode = os.environ.get("RUN_MODE", "incremental")
+print(f"run mode: {run_mode}")
 
-# Read from Kafka stream
-raw_df = spark.read \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "kafka:29092") \
-    .option("subscribe", "transactions") \
-    .option("startingOffsets", starting_offsets) \
-    .load()
+# Get starting and ending offsets based on run mode
+if run_mode == "incremental":
+    starting_offsets = get_starting_offsets_json(
+        spark, jdbc_url, jdbc_props, KAFKA_TOPIC)
+    print(
+        f"running in incremental mode with starting offset: {starting_offsets}")
+    reader = (spark.read.format("kafka")
+              .option("kafka.bootstrap.servers", "kafka:29092")
+              .option("subscribe", "transactions")
+              .option("startingOffsets", starting_offsets)
+              )
+
+elif run_mode == "backfill":
+    start = int(os.environ["STARTING_OFFSET"])
+    end = int(os.environ["ENDING_OFFSET"])
+    starting_offsets = json.dumps({KAFKA_TOPIC: {"0": start}})
+    ending_offsets = json.dumps({KAFKA_TOPIC: {"0": end}})
+    print(
+        f"running in backfill mode with starting offset: {starting_offsets} and ending offset: {ending_offsets}")
+    reader = (
+        spark.read.format("kafka")
+        .option("kafka.bootstrap.servers", "kafka:29092")
+        .option("subscribe", "transactions")
+        .option("startingOffsets", starting_offsets)
+        .option("endingOffsets", ending_offsets)
+    )
+else:
+    raise ValueError(f"Unknown RUN_MODE: {run_mode}")
+
+# Load event dataframe
+raw_df = reader.load()
 
 # Create base DF for event
 events_df = raw_df.selectExpr(
@@ -110,7 +141,7 @@ parsed_df = events_df.withColumn(
         "kafka_timestamp",
         "timestampType",
         "json.*"
-        )
+)
 
 # Flatten fund and deal object
 # separate fund id and deal id into separate columns -> important for aggregations
@@ -142,7 +173,8 @@ flat_df = parsed_df.select(
 # Detect late arriving events -> late arriving means that a transaction timestamp is more than 15 minutes before the time it was inserted into the kafka stream
 df_with_lag = flat_df.withColumn(
     "txn_age_sec",
-    unix_timestamp(col("kafka_timestamp")) - unix_timestamp(col("transaction_timestamp"))
+    unix_timestamp(col("kafka_timestamp")) -
+    unix_timestamp(col("transaction_timestamp"))
 )
 
 # Late arriving events are older than 15 minutes
@@ -152,8 +184,9 @@ late_arriving_df = df_with_lag.filter(col("txn_age_sec") > 900)
 late_arriving_df = late_arriving_df \
     .withColumn(
         "surrogate_pk",
-        sha2(concat_ws("|", lit("LATE"), col("topic"), col("partition"), col("offset")), 256),
-        ) \
+        sha2(concat_ws("|", lit("LATE"), col("topic"),
+             col("partition"), col("offset")), 256),
+    ) \
     .withColumn("run_id", lit(run_id)) \
     .select(
         "surrogate_pk",
@@ -173,7 +206,7 @@ late_arriving_df = late_arriving_df \
         "kafka_timestamp",
         col("partition").alias("kafka_partition"),
         col("offset").alias("kafka_offset"),
-        col("topic").alias("kafka_topic")        
+        col("topic").alias("kafka_topic")
     )
 
 # Idempotent upsert of late arriving events into log
@@ -191,7 +224,7 @@ winner_window = Window.partitionBy("transaction_id").orderBy(
 ranked_df = df_with_lag.withColumn("rn", row_number().over(winner_window))
 
 # Create a deduplicted df with only the winning rows for further processing
-deduped_df = ranked_df.filter(col("rn")==1)
+deduped_df = ranked_df.filter(col("rn") == 1)
 
 # Winner row per transaction_id (single source of truth)
 winners_df = deduped_df.select(
@@ -220,7 +253,7 @@ duplicate_summary = duplicate_summary \
     .withColumn(
         "surrogate_pk",
         sha2(concat_ws("|", lit("DUP"), lit(run_id), col("transaction_id")), 256),
-        ) \
+    ) \
     .withColumn("run_id", lit(run_id)) \
     .select(
         "surrogate_pk",
@@ -233,7 +266,7 @@ duplicate_summary = duplicate_summary \
         "winner_kafka_timestamp",
         "winner_partition",
         "winner_offset",
-        "winner_topic",      
+        "winner_topic",
     )
 
 # Idempotent upsert of dupulicate events into log
@@ -270,11 +303,11 @@ upsert_transaction_balance(jdbc_url, jdbc_props)
 # Derive run metrics
 run_ts = datetime.now()
 run_metrics_df = (
-            df_with_lag.agg(
-                count(lit(1)).alias("record_count"),
-                spark_sum(when(col("txn_age_sec") > 900, 1).otherwise(0)).alias("late_arrival_count")
-            )
-        ) \
+    df_with_lag.agg(
+        count(lit(1)).alias("record_count"),
+        count(when(col("txn_age_sec") > 900, 1)).alias("late_arrival_count")
+    )
+) \
     .withColumn("run_id", lit(run_id)) \
     .withColumn("duplicate_count", lit(duplicate_summary.count())) \
     .withColumn("run_timestamp", lit(run_ts))  \
@@ -284,7 +317,7 @@ run_metrics_df = (
         "duplicate_count",
         "late_arrival_count",
         "run_timestamp"
-    )
+)
 
 # Idempotent upsert into run metrics table
 upsert_run_metrics(run_metrics_df, jdbc_url, jdbc_props)
@@ -312,4 +345,8 @@ offsets_df = (
     )
 )
 
-upsert_kafka_offsets(offsets_df, jdbc_url, jdbc_props)
+if run_mode == "incremental":
+    print("Updating kafka offsets")
+    upsert_kafka_offsets(offsets_df, jdbc_url, jdbc_props)
+else:
+    print("Backfill mode running - skipping Kafka offset update")
