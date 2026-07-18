@@ -1,56 +1,61 @@
 # Streaming Fund Balance Engine
 
-## Introduction
+## Overview
 
-The Streaming Fund Balance Engine is an event-driven finance pipeline designed to showcase modern data engineering capabilities using Kafka, Airflow, and Apache Spark. It simulates transaction event flow across funds, maintains an append-only event log, and ultimately computes canonical fund balances through batch processing.
+The Streaming Fund Balance Engine is a local event-driven data pipeline built with Kafka, Spark, Airflow, PostgreSQL, and Docker. A Python producer emits fund transactions to Kafka; Airflow submits bounded Spark batch jobs that transform those events, write an idempotent transaction ledger, and recompute current balances by fund and deal.
 
-This project demonstrates end-to-end data engineering skills—from event generation through idempotent state derivation—and is structured for senior-level portfolio and interview discussion.
+The design emphasizes replay safety, deterministic deduplication, offset-based incremental reads, bounded backfills, audit logs, and testable DataFrame transformations.
 
-## Technologies Used
+## 30-second read
 
-- **Apache Kafka**: Event streaming and durable messaging backbone
-- **Apache Spark**: Batch processing and stateful aggregation
-- **Apache Airflow**: Workflow orchestration and scheduling
-- **Python**: Emitter and consumer applications
-- **Docker**: Containerized services for local development
-- **PostgreSQL**: Ledger, balances, run metrics, audit logs, and Kafka offset checkpoints
+- **Flow:** Python producer → Kafka → Airflow-triggered Spark batch → PostgreSQL ledger, fund/deal balances, audit logs, metrics, and checkpoints.
+- **Processing model:** scheduled incremental Kafka reads, not Structured Streaming. Successful runs resume from PostgreSQL offsets; operators can replay a bounded offset range without advancing the incremental pointer.
+- **Correctness:** Spark deduplicates each batch deterministically, signs credits/debits, writes a first-write-wins ledger, and recomputes balances from the full ledger so retries do not double-count money.
+- **Auditability:** every event retains Kafka coordinates; duplicate groups, late arrivals, run metrics, and checkpoints are queryable in PostgreSQL and correlated with Airflow `run_id`.
+- **Testing:** pytest covers Airflow configuration/failure paths and production Spark DataFrame transforms using a local shared `SparkSession`.
+- **Scope:** this is a single-partition local reference implementation. The README explicitly documents production upgrades and current limitations.
+
+**Stack:** Kafka · Spark · Airflow/Astro · PostgreSQL · Docker · Python · pytest
+
+**Start here:** [run the pipeline](#usage) · [run the tests](#automated-testing) · [review trade-offs](#key-engineering-decisions)
+
+## Contents
+
+- [Architecture](#architecture)
+- [Key engineering decisions](#key-engineering-decisions)
+- [Spark processing logic](#spark-processing-logic)
+- [Offset-based batch processing](#offset-based-batch-processing)
+- [PostgreSQL schema](#postgresql-schema)
+- [Airflow orchestration](#airflow-orchestration)
+- [Event schema](#event-schema)
+- [Prerequisites](#prerequisites)
+- [Usage](#usage)
+- [Automated testing](#automated-testing)
 
 ## Architecture
 
-The system is built around four core components:
+```text
+Python producer
+      │
+      ▼
+Kafka topic: transactions
+      │  topic / partition / offset / broker timestamp
+      ▼
+Spark bounded batch ───────────────┐
+      │                            │
+      ├─ transaction ledger        ├─ duplicate and late-arrival logs
+      ├─ fund/deal balances        ├─ run metrics
+      └─ incremental checkpoints ──┘
+             ▲
+             │ spark-submit
+          Airflow
+```
 
-1. **Event Emitter**
-
-- Produces transaction events for multiple funds
-- Sends events into Kafka topics for downstream processing
-
-2. **Kafka Stream**
-
-- Serves as the event log and durable messaging backbone
-- Maintains an ordered, replayable history of all transactions
-
-3. **Airflow Service**
-
-- Orchestrates and schedules batch Spark jobs on a fixed interval
-- Supplies a stable `run_id` per DAG run for retries and cross-table correlation
-- Provides replay and backfill capabilities
-
-4. **Spark Processor**
-
-- Consumes transaction events from Kafka in **offset-based batches** (not Structured Streaming)
-- Resumes each run from the last successful checkpoint stored in PostgreSQL (`kafka_offsets`)
-- Writes a transaction ledger, audit logs, run metrics, and derived fund/deal balances in PostgreSQL
-
-## Key Features
-
-- Multi-fund transaction simulation with realistic fund-deal relationships
-- Append-only event stream storage with guaranteed ordering
-- Offset-based Spark batch reads with PostgreSQL checkpointing (`kafka_offsets`)
-- Batch orchestration with Airflow DAGs and task dependencies
-- **Airflow-run configuration** for incremental processing or bounded Kafka backfills (`run_mode`, `starting_offset`, `ending_offset`)
-- Spark-based balance computation with idempotency and reconciliation
-- Canonical state management for fund balances
-- Modular design for easy extension and testing
+- **Producer:** emits simulated transactions for valid fund/deal combinations.
+- **Kafka:** provides a replayable in-container log for the local demo. Compose does not currently persist Kafka data across `docker compose down`, and ordering is guaranteed only within a partition.
+- **Airflow:** runs `fund_balance_dag` daily or on demand, supplies a stable `run_id`, and supports incremental and bounded backfill modes.
+- **Spark:** reads Kafka with the batch API, applies the pure transformations in `spark/transforms.py`, and invokes JDBC sink helpers.
+- **PostgreSQL:** stores the ledger, current balances, quality metrics, audit records, and successful incremental checkpoints.
 
 ## Key Engineering Decisions
 
@@ -58,20 +63,21 @@ The system is built around four core components:
 
 - The Spark job uses the **batch** Kafka source (`spark.read.format("kafka")`) with **PostgreSQL offset checkpoints**, not Structured Streaming.
 - **Why for this project:** bounded, on-demand runs are easier to demo, replay, and explain in interviews; the same idempotency patterns (ledger, audit logs, offsets) apply whether the job is triggered manually or on a schedule.
-- **Production nuance:** sub-minute latency would push you toward Structured Streaming (Databricks, Flink, or Spark SS with checkpointing). Many fund-accounting and balance-derivation workloads still run as **scheduled micro-batches** (hourly/daily) because correctness and auditability matter more than real-time updates. The offset-table pattern here maps cleanly to that model.
+- **Production nuance:** sub-minute latency would push you toward Structured Streaming (Databricks, Flink, or Spark SS with checkpointing). Many fund-accounting and balance-derivation workloads still run as scheduled bounded batches because correctness and auditability matter more than low latency. The offset-table pattern here maps to that model.
 - **What would change at scale:** replace the JDBC offset table with Spark SS checkpoints or Kafka consumer groups; add watermarks for event-time lateness in streaming mode; keep the same ledger idempotency rules on the sink.
 
 ### Airflow → Spark via `docker exec` (local only)
 
 - The DAG task uses the Python **Docker SDK** to `exec` `spark-submit` inside the long-running `spark-master-fund-balance` container, rather than `DockerOperator` spinning up a one-off container per run.
 - **Why:** faster local iteration, code and JARs are already bind-mounted, and avoids fragile host-path mounts (especially on Windows). `DockerOperator` is the closer analog to production job submission but adds startup latency and compose wiring complexity for a portfolio demo.
-- **How it works:** Astro Airflow (`astro dev start`) runs the control plane; `docker/docker-compose.yml` runs the data plane (Kafka, Postgres, Spark). `airflow/docker-compose.override.yml` joins Airflow workers to the external `fund-pipeline` network and mounts `/var/run/docker.sock` so the task can reach the Spark container by name.
+- **How it works:** Astro Airflow (`astro dev start`) runs the control plane; `docker/docker-compose.yml` runs the data plane (Kafka, Postgres, Spark). `airflow/docker-compose.override.yml` joins Airflow services to the external `fund-pipeline` network and mounts `/var/run/docker.sock` so the task can reach the Spark container by name.
 
 ### Idempotency and replay-first design
 
-- **`transaction_ledger`:** `ON CONFLICT (transaction_id) DO NOTHING` — replays do not double-insert movements.
+- **`transaction_ledger`:** `ON CONFLICT (transaction_id) DO NOTHING` — the first persisted version of a transaction wins across batches and replays.
 - **`transaction_balance`:** full `SUM` over the ledger each run — identical ledger → identical balances.
-- **Audit logs:** deterministic SHA-256 `surrogate_pk` keys with `ON CONFLICT DO NOTHING` — first write wins across retries.
+- **Duplicate audit:** `DUP|{run_id}|{transaction_id}` is stable for retries of the same run; a new replay `run_id` produces a separate run-scoped observation.
+- **Late-arrival audit:** `LATE|{topic}|{partition}|{offset}` identifies one physical Kafka message across retries, backfills, and replays.
 - **`kafka_offsets`:** only rows with `status = 'SUCCESS'` advance `MAX(end_offset)` — failed runs do not skip data.
 - **`run_id`:** passed from Airflow (`dag_run.run_id`) so retries of the same DAG run correlate metrics and audit rows under one identifier.
 
@@ -90,36 +96,41 @@ Local Docker choices are intentional shortcuts. A production deployment would ty
 | **Secrets**       | Plain env vars in compose            | Vault, AWS Secrets Manager, or Airflow connections                                       |
 | **Observability** | Postgres audit tables + Airflow logs | Metrics (Datadog/Prometheus), alerting on `run_metrics`, data quality monitors           |
 
-For **low-latency** fund P&L or risk, Structured Streaming on Databricks with idempotent foreachBatch sinks to the same ledger schema would be the natural upgrade. For **batch SLAs** (e.g. end-of-day balances), the current micro-batch + offset checkpoint design is already production-shaped; only the runtime and ops layer would change.
+For **low-latency** fund P&L or risk, Structured Streaming with durable checkpoints and idempotent `foreachBatch` sinks would be a natural upgrade. For scheduled batch SLAs, the current bounded-read and replay-safe sink patterns remain applicable, but production hardening would also require stronger data validation, secrets management, monitoring, and failure recovery.
 
 ### Known limitations (local demo)
 
 - **Empty batches:** if a run reads zero Kafka messages, no `kafka_offsets` row is written and the read pointer does not advance (acceptable for demos; production would still record a heartbeat or empty-run checkpoint).
 - **Money as `DOUBLE PRECISION`:** fine for a portfolio; production would use `NUMERIC`/`DECIMAL`.
-- **Single partition / topic:** offset logic assumes partition `0` on first run; extend `get_starting_offsets_json()` when adding partitions.
+- **Single-partition design:** the Compose stack relies on Kafka auto-creating `transactions`, typically with one partition. Backfill JSON and first-run fallback assume partition `0`. Checkpoint upserts also use `run_id` as the sole primary key, so multi-partition checkpoint writes are not supported without a composite key such as `(run_id, topic, partition)`.
+- **Batch-scoped deduplication:** duplicates are ranked only within the current Kafka slice, using `transaction_timestamp`, then `kafka_timestamp`, then `offset`. Across separate runs, `transaction_ledger` is first-write-wins by `transaction_id`; later corrections with the same id are not applied.
+- **Status handling:** `status` is retained for audit output but is not currently used to exclude `FAILED` events from the ledger.
+- **Checkpoint source:** checkpoint bounds are currently derived from the post-deduplication ledger DataFrame rather than directly from the raw Kafka batch. A production version should checkpoint the raw consumed partition ranges so duplicate-only edge cases cannot leave the pointer behind the actual read boundary.
+- **Demo timeout:** the Airflow Spark task has a 10-minute execution timeout; increase it for larger batches or slower machines.
+- **Concurrent runs:** JDBC helpers use shared staging-table names, so overlapping Spark runs are not isolated. Production sinks should use run-scoped staging tables or transactional merge patterns and enforce appropriate Airflow concurrency limits.
 
 ## Spark Processing Logic
 
-The Spark job processes Kafka transaction events into a durable **transaction ledger**, then derives deterministic, auditable balances per fund/deal pair.
+The Spark job processes Kafka transaction events into a durable **transaction ledger**, then derives auditable balances per fund/deal pair.
 
 1. **Read data from Kafka (offset-based batch)**
 
 - Before reading, load the last successful checkpoint from `kafka_offsets` and build Spark’s `startingOffsets` JSON (see [Offset-based batch processing](#offset-based-batch-processing)).
 - If the checkpoint table is empty, start at offset **0** for partition **0** (first run).
-- Consume only new messages from that position through the current log end (or an explicit `endingOffsets` bound during development).
+- Consume only new messages from that position through the current log end, or through an explicit exclusive `endingOffsets` bound in backfill mode.
 - Retain metadata (`topic`, `partition`, `offset`, `kafka_timestamp`) for traceability and deterministic tie-breaking.
 
 2. **Flatten into a DataFrame**
 
 - Parse JSON payloads into a typed schema.
 - Flatten nested `fund` and `deal` objects into top-level columns.
-- Apply fallback handling for missing fields to support schema evolution.
+- Parse `event_timestamp` and `transaction_timestamp` as timestamps; missing timestamp values currently fall back to `1900-01-01T00:00:00`.
 - **Type note:** emitters send `fund_id` and `deal_id` as JSON integers; the Spark schema reads them as **strings** for consistent JDBC/Postgres handling (values coerce cleanly to `VARCHAR` keys in the database).
 
 3. **Detect late arriving events**
 
 - Define **late** as **ingest lag**: how long after the business-time `transaction_timestamp` the record appeared in Kafka, using epoch seconds: `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`.
-- Flag rows where ingest lag exceeds a fixed threshold (e.g. **900 seconds**); the same message always yields the same lag on replay, unlike comparisons to `current_timestamp()`.
+- Flag rows where ingest lag exceeds a hard-coded **900-second** threshold; the same message always yields the same lag on replay, unlike comparisons to `current_timestamp()`.
 - Rows that qualify are written to `late_arriving_event_log`; each pipeline run also records how many late rows were observed in that run’s batch in `run_metrics` (see [Late arriving events (design)](#late-arriving-events-design)).
 
 4. **Identify duplicate events**
@@ -130,7 +141,7 @@ The Spark job processes Kafka transaction events into a durable **transaction le
 5. **Determine winning duplicate records**
 
 - Rank records per `transaction_id` and keep the highest-ranked row as the winner.
-- Persist winner metadata to an audit table to document why specific rows were retained.
+- For ids that are duplicated within the batch, persist winner metadata in `duplicate_records_log` to document which row was retained.
 
 6. **Build duplicate summary diagnostics**
 
@@ -143,6 +154,7 @@ The Spark job processes Kafka transaction events into a durable **transaction le
 - Convert transaction types into signed cash flow values:
   - `DEBIT` → negative amount
   - `CREDIT` → positive amount
+  - any other value, including `REVERSAL` → zero in the current implementation
 
 8. **Upsert into the transaction ledger**
 
@@ -152,11 +164,11 @@ The Spark job processes Kafka transaction events into a durable **transaction le
 9. **Derive canonical balances from the ledger**
 
 - Recompute `transaction_balance` as `SUM(transaction_amount)` grouped by `(fund_id, deal_id)` over the **entire** ledger (not a batch-only incremental add in SQL).
-- Upsert into `transaction_balance` with `ON CONFLICT DO UPDATE`, setting `balance` to the new aggregate. If the ledger is unchanged (same inputs replayed), the sums are unchanged and balances stay the same (**idempotent**). If new transactions were added to the ledger since the last run, affected fund/deal balances update to reflect the new totals.
+- Upsert into `transaction_balance` with `ON CONFLICT DO UPDATE`, setting `balance` to the recomputed aggregate. If the ledger is unchanged, the values remain the same even though `last_modified` is refreshed. If new transactions were added, affected fund/deal balances reflect the new totals.
 
 10. **Aggregate and persist run metrics**
 
-- Build one row per `run_id` with `record_count` (rows in the batch), `duplicate_count` (duplicate groups observed in the batch), and `late_arrival_count` (rows matching the ingest-lag rule in the batch).
+- Build one row per `run_id` with `record_count` (Kafka rows after the parse attempt, including rows with null fields when JSON is malformed), `duplicate_count` (duplicate groups observed in the batch), and `late_arrival_count` (rows matching the ingest-lag rule in the batch).
 - Upsert into `run_metrics` on `run_id` with `ON CONFLICT DO UPDATE`, so a **retry/replay of the same run** replaces metrics with the latest computed values for that run.
 
 ## Offset-based batch processing
@@ -165,15 +177,15 @@ Spark uses the **batch** Kafka source (`spark.read.format("kafka")`), not Struct
 
 ### Checkpoint table: `kafka_offsets`
 
-PostgreSQL table `kafka_offsets` records **per-run consumption metadata** and acts as the read pointer for the next batch:
+PostgreSQL table `kafka_offsets` records **per-run checkpoint metadata** and acts as the read pointer for the next incremental batch:
 
 | Column          | Description                                                                                                                              |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `run_id`        | Correlates with the pipeline run (from Airflow `dag_run.run_id` when orchestrated, or a UUID fallback in `spark/job.py` for manual runs) |
 | `topic`         | Kafka topic name (e.g. `transactions`)                                                                                                   |
 | `partition`     | Topic partition id                                                                                                                       |
-| `start_offset`  | First offset read in this run (inclusive; matches Spark `startingOffsets`)                                                               |
-| `end_offset`    | **Next** offset to read after this run (exclusive end; becomes the next run’s `startingOffsets`)                                         |
+| `start_offset`  | Inclusive lower bound recorded for this run from the post-dedup ledger offsets                                                           |
+| `end_offset`    | Exclusive upper bound recorded for this run (`max(offset) + 1` from that ledger slice); intended as the next incremental start           |
 | `status`        | Run outcome (e.g. `SUCCESS`); only successful runs advance the read pointer                                                              |
 | `run_timestamp` | When the checkpoint row was recorded                                                                                                     |
 
@@ -206,7 +218,7 @@ That value is passed to `.option("startingOffsets", ...)`.
          └──────── write row (start/end, SUCCESS) ───────┘
 ```
 
-After sinks succeed, insert a row into `kafka_offsets` for the current `run_id` with the processed range and `status = 'SUCCESS'`. Failed runs should not advance the pointer (or should record a non-`SUCCESS` status so `MAX(end_offset)` ignores them).
+After the sinks succeed, a **non-empty incremental** run inserts or updates a `kafka_offsets` row for the current `run_id` with `status = 'SUCCESS'`. Empty batches and backfill runs deliberately skip this write. If the Spark job fails first, no new successful checkpoint is recorded.
 
 ## Late arriving events (design)
 
@@ -216,7 +228,7 @@ This section records the product and replay semantics for **late** detection and
 
 ### Definition of “late”
 
-A record is treated as **late for observability** when **ingest lag** exceeds a configured threshold:
+A record is treated as **late for observability** when **ingest lag** exceeds the hard-coded 900-second threshold:
 
 - **Ingest lag (seconds)** = `unix_timestamp(kafka_timestamp) - unix_timestamp(transaction_timestamp)`
 - **`kafka_timestamp`** is the timestamp from the Spark Kafka source for that message (broker metadata).
@@ -240,7 +252,7 @@ Comparing business time to **job wall clock** changes every time you run or repl
 
 ## PostgreSQL schema
 
-PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, and **drill-down logs**. Each run is tagged with a **`run_id`** for correlation across tables (see [Airflow orchestration](#airflow-orchestration)).
+PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, and **drill-down logs**. Run metrics, checkpoints, and audit observations carry a **`run_id`** for correlation (see [Airflow orchestration](#airflow-orchestration)); the ledger and balance tables do not.
 
 ### Tables and grain
 
@@ -251,7 +263,7 @@ PostgreSQL holds the canonical **balance state**, **per-run rollup metrics**, an
 | `run_metrics`             | `run_id`                                                                 | One row per pipeline run: volumes and quality counts; updated on retry of the same `run_id`.                                  |
 | `duplicate_records_log`   | **Surrogate PK** + unique `(run_id, transaction_id)`                     | Duplicate groups for that run: counts, min/max business time, and full Kafka pointer for the retained winner.                 |
 | `late_arriving_event_log` | **Surrogate PK** + unique `(kafka_topic, kafka_partition, kafka_offset)` | One durable row per **physical Kafka message** flagged late; survives retries, backfills, and replays without double inserts. |
-| `kafka_offsets`           | `run_id`                                                                 | Per-run Kafka consumption checkpoint: topic, partition, offset range, and status for offset-based batch resume.               |
+| `kafka_offsets`           | `run_id`                                                                 | Per-run incremental checkpoint: topic, partition, offset range, and status for offset-based batch resume.                     |
 
 ### Idempotent surrogate keys (SHA-256, 64-char lowercase hex)
 
@@ -271,19 +283,19 @@ Both log tables use a **`surrogate_pk`** primary key computed in Spark as **`sha
 
 - `fund_id`, `deal_id` — natural key (identifiers only; names live on events / dimensions, not on state).
 - `balance` — `SUM(transaction_amount)` from `transaction_ledger` for that fund/deal (full snapshot recompute each run).
-- **Idempotency:** identical ledger contents produce identical sums; `ON CONFLICT DO UPDATE` refreshes balances only when the recomputed total changes (e.g. new `transaction_id`s landed in the ledger).
+- **Idempotency:** identical ledger contents produce identical sums; `ON CONFLICT DO UPDATE` writes the recomputed balance and refreshes `last_modified`.
 
 **`run_metrics`**
 
-- `record_count` — rows considered in the run after parsing (aligned with Spark’s batch scope).
+- `record_count` — Kafka rows in the batch after the parse attempt. Malformed JSON can still produce a counted row with null fields.
 - `duplicate_count` — number of distinct `transaction_id` values that had duplicates in that run (batch observation); on first load for a `run_id`, should match `SELECT COUNT(*) FROM duplicate_records_log WHERE run_id = ?`.
 - `late_arrival_count` — number of messages in **this run’s batch** that satisfied the ingest-lag late rule in Spark (**observed in batch**). It does **not** necessarily equal new rows inserted into `late_arriving_event_log` on replay (`ON CONFLICT DO NOTHING` on `surrogate_pk`).
 - `run_timestamp` — when the run was recorded (updated on `ON CONFLICT DO UPDATE` when the same `run_id` is retried).
 
 **`kafka_offsets`**
 
-- One row per pipeline run (`run_id` primary key) recording which Kafka slice was consumed.
-- `start_offset` / `end_offset` — inclusive start and **exclusive** end of the batch (see [Offset-based batch processing](#offset-based-batch-processing)).
+- One row per incremental pipeline run (`run_id` primary key) recording the checkpointed Kafka slice. The current primary key and backfill configuration are designed for one partition.
+- `start_offset` / `end_offset` — inclusive start and **exclusive** end derived from the post-deduplication ledger DataFrame for that run, not always the raw consumed Kafka range (see [Offset-based batch processing](#offset-based-batch-processing)).
 - `status` — only rows with `SUCCESS` participate in `MAX(end_offset)` when computing the next `startingOffsets`.
 - Ties batch boundaries to the same `run_id` used in `run_metrics` and audit logs.
 
@@ -306,7 +318,7 @@ Airflow lives in **`airflow/`** (Astronomer Astro project) and orchestrates the 
 - **File:** `airflow/dags/fund_balance_dag.py`
 - **Schedule:** `@daily` (demo cadence; adjust as needed)
 - **Retries:** 2, with exponential backoff starting at 2 seconds (`default_args` + task-level `retry_exponential_backoff`)
-- **Failure handling:** `on_failure_callback` in `airflow/include/fund_balance_dag/callbacks.py` logs task context and classifies failures (timeout vs application error)
+- **Failure handling:** `on_failure_callback` in `airflow/include/fund_balance_dag/callbacks.py` logs task context and classifies timeout, manual-failure, and application errors.
 
 ### How the Spark job is triggered
 
@@ -331,7 +343,7 @@ The task does **not** use `DockerOperator`. It:
 
 The DAG task reads `dag_run.conf` first, then falls back to DAG params, and passes values to Spark as environment variables: `RUN_ID`, `RUN_MODE`, and (in backfill mode) `STARTING_OFFSET` / `ENDING_OFFSET`.
 
-**Incremental (default):** Spark calls `get_starting_offsets_json()` and reads through the current log end. On success, a new `kafka_offsets` row is written with `status = SUCCESS`.
+**Incremental (default):** Spark calls `get_starting_offsets_json()` and reads through the current log end. On a non-empty successful run, a new `kafka_offsets` row is written with `status = SUCCESS`.
 
 **Backfill:** Spark reads only the offset range `[starting_offset, ending_offset)` and still applies the same idempotent ledger, balance, and audit logic. **`kafka_offsets` is not updated** on backfill runs, so reprocessing history does not move the incremental read pointer.
 
@@ -350,7 +362,7 @@ If `run_mode` is `backfill` but either offset is missing, the DAG task fails fas
 ```
 
 1. Start the data plane: `docker compose -f docker/docker-compose.yml up -d`
-2. Copy `airflow/docker-compose.override.yml` behavior is applied automatically by Astro when present — it attaches Airflow containers to **`fund-pipeline`** and mounts the Docker socket.
+2. Astro automatically applies `airflow/docker-compose.override.yml`, attaching Airflow services to **`fund-pipeline`** and mounting the Docker socket.
 3. From `airflow/`: `astro dev start` (UI at http://localhost:8080)
 4. Trigger **`fund_balance_dag`** manually or wait for the schedule.
 
@@ -358,33 +370,27 @@ If `run_mode` is `backfill` but either offset is missing, the DAG task fails fas
 
 ### Offset checkpoints and DAG success
 
-`kafka_offsets` rows are written at the **end** of a successful Spark run inside `spark/job.py`. If the DAG task fails before `spark-submit` completes, no new `SUCCESS` checkpoint is recorded and the next run resumes from the last successful offset. Combined with idempotent ledger writes, this makes Airflow retries safe.
+`kafka_offsets` rows are written at the **end** of a successful non-empty incremental Spark run inside `spark/job.py`. If the DAG task fails before `spark-submit` completes, no new `SUCCESS` checkpoint is recorded and the next run resumes from the last successful offset. Combined with idempotent ledger writes, this makes Airflow retries safe.
 
 ## Event Schema
 
-The event schema represents a financial transaction event in an investment fund context. Each event captures a cash flow between investors and the fund, where the fund holds investments in specific deals.
+The event schema represents a financial transaction event in an investment fund context. Each event captures a fund/deal cash-flow movement; the current schema does not model individual investors.
 
-### Design Principles
+### Current producer behavior
 
 - **Fund-Deal Relationship**: Transactions are tied to a specific fund and one of its associated deals, reflecting real-world investment structures.
-- **Cash Flow Direction**:
-  - `CREDIT`: Capital calls (money flowing into the fund from investors)
-  - `DEBIT`: Distributions (money flowing out to investors)
-  - `REVERSAL`: Corrections or reversals of previous transactions
-- **Status Lifecycle**: Indicates processing state:
-  - `PENDING`: Transaction initiated but not yet posted
-  - `COMPLETED`: Successfully posted
-  - `FAILED`: Processing failed
-- **Ordering**: Events are ordered by `transaction_timestamp` (ISO 8601 format) to maintain chronological sequence in the event log.
-- **Uniqueness**: Each transaction has a unique `transaction_id` (UUID) for idempotency and deduplication.
+- **Cash-flow direction:** the producer emits `CREDIT` and `DEBIT`. Spark maps credits positive, debits negative, and any other value to zero.
+- **Status:** the producer currently emits `COMPLETED` or `FAILED`; `PENDING` is present only as a commented example. Status does not yet control ledger eligibility.
+- **Event time:** `transaction_timestamp` is randomized up to 30 minutes before production time, which creates late-arrival test data. Kafka ordering remains partition/offset ordering, not business-time ordering.
+- **Identity:** normal producer events use UUID transaction ids. `emitter/insert_duplicate.py` intentionally publishes the same event twice to exercise deduplication.
 
 ### JSON Structure
 
 ```json
 {
   "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
-  "transaction_timestamp": "2026-05-02T14:30:00.000Z",
-  "event_timestamp": "2026-05-02T14:30:05.123Z",
+  "transaction_timestamp": "2026-05-02T14:30:00.000000",
+  "event_timestamp": "2026-05-02T14:30:05.123000",
   "transaction_amount": 125000.5,
   "currency": "USD",
   "transaction_type": "CREDIT",
@@ -398,7 +404,7 @@ The event schema represents a financial transaction event in an investment fund 
     "deal_name": "Deal B"
   },
   "metadata": {
-    "source": "simulated-emitter",
+    "source": "simulator",
     "strategy": "growth"
   }
 }
@@ -409,25 +415,23 @@ The event schema represents a financial transaction event in an investment fund 
 | Field                   | Type              | Description                                                                              | Required |
 | ----------------------- | ----------------- | ---------------------------------------------------------------------------------------- | -------- |
 | `transaction_id`        | string (UUID)     | Unique identifier for the transaction                                                    | Yes      |
-| `transaction_timestamp` | string (ISO 8601) | When the transaction occurred (used for event ordering)                                  | Yes      |
-| `event_timestamp`       | string (ISO 8601) | When the event was produced / ingested (emitter wall clock)                              | Yes      |
-| `transaction_amount`    | number (float)    | Transaction amount in specified currency                                                 | Yes      |
-| `currency`              | string            | Currency code (e.g., USD, EUR)                                                           | Yes      |
-| `transaction_type`      | string            | Direction of cash flow: `DEBIT`, `CREDIT`, `REVERSAL`                                    | Yes      |
-| `status`                | string            | Processing status: `PENDING`, `COMPLETED`, `FAILED`                                      | Yes      |
+| `transaction_timestamp` | string (ISO 8601) | Business time used as the primary deduplication winner field                             | Yes      |
+| `event_timestamp`       | string (ISO 8601) | Producer wall-clock creation time; late detection uses Kafka broker timestamp instead    | Yes      |
+| `transaction_amount`    | number (float)    | Transaction amount in the event currency                                                 | Yes      |
+| `currency`              | string            | Currency code present on the event; balances currently ignore currency and assume USD    | Yes      |
+| `transaction_type`      | string            | Direction of cash flow; the current producer emits `DEBIT` or `CREDIT`                   | Yes      |
+| `status`                | string            | Producer status; currently `COMPLETED` or `FAILED`                                       | Yes      |
 | `fund`                  | object            | Fund context: `fund_id` (integer in JSON; read as string in Spark), `fund_name` (string) | Yes      |
 | `deal`                  | object            | Deal context: `deal_id` (integer in JSON; read as string in Spark), `deal_name` (string) | Yes      |
 | `metadata`              | object            | Optional enrichment data (e.g., source, strategy)                                        | No       |
 
-### Schema Evolution
+### Schema and state notes
 
-New fields are added as optional to maintain backward compatibility. Consumers apply defaults for missing fields (e.g., `metadata` defaults to an empty object).
-
-**Spark Processing Strategy**: When reading events in PySpark, missing fields are handled with default values using functions like `coalesce()` or `.get()` with fallbacks. For example, a new `risk_factor` field defaults to 0.0 if absent.
-
-**State Table Design**: `transaction_balance` stores only `fund_id`, `deal_id`, `balance`, and `last_modified` so the ledger state stays narrow and authoritative; enrichment (names, metadata) stays on raw events or drill-down logs.
-
-**Identifier types**: JSON events use integer `fund_id` / `deal_id`; Spark declares them as strings in the parse schema and persists them as `VARCHAR` in PostgreSQL for consistent keys across sinks.
+- `metadata` is optional in the Spark schema. The job does not currently default missing metadata to an empty object or persist it to the ledger.
+- Missing event or transaction timestamps receive a sentinel `1900-01-01` value during flattening. Other malformed or missing required fields do not yet have a dead-letter path.
+- `currency` is retained on late-event audit rows but is dropped before ledger and balance writes, so multi-currency amounts would currently be summed together.
+- `transaction_balance` stays narrow: `fund_id`, `deal_id`, `balance`, and `last_modified`. Names and event attributes remain outside canonical balance state.
+- JSON events use integer `fund_id` / `deal_id`; Spark parses them as strings and PostgreSQL stores them as `VARCHAR`.
 
 ## Project Structure
 
@@ -435,46 +439,52 @@ New fields are added as optional to maintain backward compatibility. Consumers a
 streaming-fund-balance-engine/
 ├── emitter/
 │   ├── emitter.py              # Event producer for transaction events
+│   ├── consumer.py             # Simple console consumer for inspection
 │   └── insert_duplicate.py     # Publishes the same transaction twice (duplicate testing)
 ├── spark/
 │   ├── job.py                  # Spark batch processing job
+│   ├── transforms.py           # Pure DataFrame transformations
 │   ├── upsert_functions.py     # JDBC upsert helpers (ledger, balances, audit logs)
-│   └── query_wrappers.py       # Postgres read/execute utilities
+│   ├── query_wrappers.py       # Postgres read/execute utilities
+│   └── tests/
+│       ├── conftest.py         # Shared local SparkSession fixture
+│       └── test_transforms_example.py
 ├── airflow/
 │   ├── dags/
 │   │   └── fund_balance_dag.py # Airflow DAG (docker exec → spark-submit)
 │   ├── include/fund_balance_dag/
 │   │   └── callbacks.py        # Task failure logging
+│   ├── tests/dags/
+│   │   └── test_fund_balance_dag.py
 │   ├── docker-compose.override.yml  # Join fund-pipeline network + docker.sock
 │   └── requirements.txt        # docker SDK for DAG task
 ├── docker/
 │   └── docker-compose.yml      # Kafka, Postgres, Spark (data plane)
 ├── db/
 │   └── init.sql                # Database initialization script
-├── jars/                       # Kafka + PostgreSQL JARs (not committed; see Dependencies)
+├── jars/                       # Kafka + PostgreSQL JARs (not committed; see Prerequisites)
+├── requirements.txt            # Local producer and PySpark dependencies
 └── README.md
 ```
 
-### Component Details
+## Prerequisites
 
-- **emitter/** — Generates transaction events and publishes them to Kafka; `insert_duplicate.py` supports dedup testing
-- **spark/** — Batch Kafka consumer, transformations, and JDBC upserts to Postgres
-- **airflow/** — Astro project with `fund_balance_dag` and failure callbacks; orchestrates Spark via Docker exec
-- **docker/** — Data-plane Compose stack (Kafka, Postgres on host port 5433, Spark standalone cluster)
-- **db/** — Postgres DDL for ledger, balances, metrics, audit logs, and offset checkpoints
+- Docker Desktop with Docker Compose
+- Python and `pip` for the producer and local Spark tests
+- Java 17 for the locally pinned PySpark 4.1 test runtime
+- [Astronomer CLI](https://www.astronomer.io/docs/astro/cli/install-cli) for the Airflow environment
 
-## What This Project Demonstrates
+Install the local Python dependencies and pytest from the repository root:
 
-- Design of a scalable, loosely coupled pipeline for financial events
-- Use of Kafka for durable event streaming and replayability
-- Orchestration patterns using Airflow DAGs and task dependencies
-- Spark batch processing and stateful aggregation logic
-- How event-driven systems can support transactional state updates
-- Ability to build a real-world data engineering solution end to end
+```bash
+python -m pip install -r requirements.txt pytest
+```
 
-## Dependencies
+The Compose data plane uses Spark **3.5.1**. The root requirements currently pin PySpark **4.1.1** for local transform tests; the tested APIs are compatible, but production projects should align test and runtime versions exactly.
 
-Download these JARs into `./jars` before running Docker Compose:
+### Spark connector JARs
+
+Download these JARs into `./jars` before starting the data plane:
 
 - [spark-sql-kafka-0-10_2.12-3.5.1.jar](https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.1/spark-sql-kafka-0-10_2.12-3.5.1.jar)
 - [spark-token-provider-kafka-0-10_2.12-3.5.1.jar](https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.1/spark-token-provider-kafka-0-10_2.12-3.5.1.jar)
@@ -482,12 +492,12 @@ Download these JARs into `./jars` before running Docker Compose:
 - [commons-pool2-2.11.1.jar](https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar)
 - [postgresql-42.7.3.jar](https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar) (JDBC driver for writing to PostgreSQL from Spark)
 
-### Connecting Spark to PostgreSQL
+### PostgreSQL connection details
 
-`docker-compose.yml` starts PostgreSQL with database **`fund_balance`**, user **`funduser`**, password **`fundpass`**, and applies **`db/init.sql`** on first data volume creation.
+`docker/docker-compose.yml` starts PostgreSQL with database **`fund_balance`**, user **`funduser`**, password **`fundpass`**, and applies **`db/init.sql`** on first data volume creation.
 
-- **Spark runs inside the Compose network** (e.g. `spark-submit` from `spark-master-fund-balance`): use host **`postgres`**, port **`5432`**: `jdbc:postgresql://postgres:5432/fund_balance`
-- **Spark runs on your host machine** (IDE / local `spark-submit`): use **`localhost:5433`** (host-mapped port; same credentials).
+- The Spark job currently hard-codes `jdbc:postgresql://postgres:5432/fund_balance`, so `spark-submit` is intended to run inside the Compose network (for example from `spark-master-fund-balance`).
+- Postgres is also published on host port **`5433`** for local inspection with `psql` or a SQL client. Host-local Spark would need a JDBC URL override that is not implemented yet.
 
 Put the PostgreSQL JAR in `./jars` (on Spark’s extra classpath via Compose). PySpark uses `format("jdbc")` with upsert logic implemented via staging tables and SQL `ON CONFLICT` in `spark/upsert_functions.py`.
 
@@ -501,7 +511,7 @@ From the repo root:
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-Download JARs into `./jars` first (see [Dependencies](#dependencies)). Spark UI: http://localhost:8081 — Postgres on host port **5433**.
+Download JARs into `./jars` first (see [Spark connector JARs](#spark-connector-jars)). Spark UI: http://localhost:8081 — Postgres on host port **5433**.
 
 ### 2. Publish events
 
@@ -509,12 +519,15 @@ Download JARs into `./jars` first (see [Dependencies](#dependencies)). Spark UI:
 python emitter/emitter.py
 ```
 
+The producer emits one event every 10 seconds until stopped.
+
 ### 3. Run the pipeline
 
 **Option A — Airflow (recommended for scheduled / correlated `run_id`):**
 
 ```bash
-cd airflow && astro dev start
+cd airflow
+astro dev start
 ```
 
 Open http://localhost:8080 and trigger **`fund_balance_dag`**.
@@ -526,7 +539,7 @@ Alternatively, trigger with JSON config (Linux / macOS, or `docker exec` into th
 
 **Option B — Manual Airflow DAG run from the terminal**
 
-Incremental test (no custom config):
+Manual incremental DAG execution (no custom config):
 
 ```bash
 astro dev run dags test fund_balance_dag 2025-01-01
@@ -613,17 +626,49 @@ python emitter/insert_duplicate.py
 
 Then run the Spark job and inspect `duplicate_records_log` (and `run_metrics.duplicate_count`) to confirm deduplication and per-run duplicate summary logging.
 
-## Why This Project Matters
+## Automated Testing
 
-This repo is built to demonstrate strong data engineering skills in both architecture and implementation. It shows how to:
+The project has two classes of automated tests:
 
-- Build reliable event-driven systems
-- Connect streaming and batch processing patterns
-- Manage orchestration and workflow dependencies
-- Produce a strong technical story for data engineering interviews or portfolio presentations
+1. **Airflow tests** validate DAG configuration, runtime parameter handling, command construction, and failure classification.
+2. **Spark tests** run the production DataFrame transformations against small in-memory datasets using a local Spark session.
 
-## Notes
+These test suites are intentionally separate because they run in different environments. Airflow tests run inside the Astro test environment, while Spark tests run with local PySpark from the repository root.
 
-- **Two Docker contexts:** data plane (`docker/`) and Airflow (`airflow/` via Astro) are started separately and joined on the `fund-pipeline` network.
-- **DAG `execution_timeout`:** the Spark task currently uses a short timeout suitable for small demos; increase it in `fund_balance_dag.py` if batch runs exceed the limit.
-- When presenting the project, walk through **emit → incremental run → backfill → replay → duplicate inject** to show idempotency and audit trails end to end.
+### Airflow tests
+
+Navigate to the `airflow` directory and run:
+
+```bash
+cd airflow
+astro dev pytest tests/dags/test_fund_balance_dag.py -v
+```
+
+The Airflow test suite verifies that:
+
+1. A DAG run with no custom configuration defaults to `incremental` mode.
+2. A backfill run passes the configured starting and ending offsets to Spark.
+3. Backfill mode raises an error when required offsets are missing.
+4. Values supplied through `dag_run.conf` take precedence over DAG `params`.
+5. The DAG contract remains intact, including params, tags, retries, execution timeout, and task failure callback wiring.
+6. The failure callback maps timeout, manual-failure, and application exceptions to stable reason labels.
+
+The Docker SDK call is mocked in these tests, so they validate Airflow orchestration logic without launching a real Spark job.
+
+### Spark tests
+
+From the repository root, run:
+
+```bash
+python -m pytest spark/tests -v
+```
+
+The Spark test suite creates one local `SparkSession` for the pytest session and runs the production functions from `spark/transforms.py` against small in-memory DataFrames. It verifies that:
+
+1. Credits are signed positive, debits negative, and unsupported types such as `REVERSAL` become zero.
+2. Deduplication retains only the most recent row when a transaction appears more than once.
+3. Kafka offset is used as the final tie-breaker when duplicate rows have the same transaction timestamp and Kafka timestamp.
+4. Events older than the hard-coded 900-second lateness threshold are selected and shaped correctly for the late-arrival audit log.
+5. The offset transform produces an exclusive ending offset, calculated as the maximum input offset plus one for the DataFrame passed into the function.
+
+The Spark unit tests do not require Kafka or PostgreSQL. They test deterministic DataFrame transformations independently from external I/O. End-to-end behavior is manually demonstrable through the Usage and replay checks above, but is not currently covered by automated integration tests.
